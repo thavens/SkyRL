@@ -640,9 +640,11 @@ class TinkerEngine:
         output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
         # When the caller provides a sampling_session_seq_id the save is
-        # transient — weights only need to reach the inference engines, not
-        # disk.  Backends can skip the expensive write in that case.
-        persist = request_data.sampling_session_seq_id is None
+        # usually transient: colocated / backend-managed inference only needs
+        # weights in the live inference engines. External inference is
+        # different; the API process forwards samples by extracting this
+        # checkpoint archive and asking the external engine to load it.
+        persist = self.config.external_inference_url is not None or request_data.sampling_session_seq_id is None
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
             self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)

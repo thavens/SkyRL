@@ -1,4 +1,6 @@
 import asyncio
+import errno
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -26,11 +28,17 @@ def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None
     if not target_dir.exists():
         try:
             with download_and_unpack(checkpoint_path) as extracted_path:
-                extracted_path.rename(target_dir)
-        except FileExistsError:
+                try:
+                    extracted_path.rename(target_dir)
+                except OSError as e:
+                    if e.errno != errno.EXDEV:
+                        raise
+                    shutil.move(str(extracted_path), str(target_dir))
+        except (FileExistsError, OSError, shutil.Error) as e:
             # This could happen if two processes try to download the file.
             # In that case the other process won the race and created target_dir.
-            pass
+            if not target_dir.exists() or (isinstance(e, OSError) and e.errno not in (errno.EEXIST, errno.ENOTEMPTY)):
+                raise
 
 
 class ExternalInferenceClient:
@@ -105,6 +113,12 @@ class ExternalInferenceClient:
             target_dir = self.lora_base_dir / model_name
 
             await asyncio.to_thread(_extract_checkpoint_sync, checkpoint_path, target_dir)
+            load_response = await http_client.post(
+                "/load_lora_adapter",
+                json={"lora_name": model_name, "lora_path": str(target_dir)},
+            )
+            if load_response.status_code >= 400 and "already" not in load_response.text.lower():
+                load_response.raise_for_status()
 
         payload = {
             "model": model_name,

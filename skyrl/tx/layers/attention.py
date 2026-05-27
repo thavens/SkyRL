@@ -3,9 +3,10 @@
 import jax
 import jax.numpy as jnp
 
-# cuDNN flash attention supported dtypes
+# cuDNN flash attention supported dtypes/head dimensions
 # https://github.com/jax-ml/jax/blob/8b1f782540f71fbe230a2dccd331975faafc6c83/jax/_src/cudnn/fused_attention_stablehlo.py#L290
 _CUDNN_SUPPORTED_DTYPES = (jnp.float16, jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2)
+_CUDNN_MAX_HEAD_DIM = 128
 
 
 def dot_product_attention(
@@ -34,7 +35,8 @@ def dot_product_attention(
     """
     scale = 1.0 / head_dim**0.5
 
-    if jax.default_backend() == "gpu" and q.dtype in _CUDNN_SUPPORTED_DTYPES:
+    cudnn_supported_head_dim = head_dim <= _CUDNN_MAX_HEAD_DIM and head_dim % 8 == 0
+    if jax.default_backend() == "gpu" and q.dtype in _CUDNN_SUPPORTED_DTYPES and cudnn_supported_head_dim:
         kv_seq_lengths = attention_mask.sum(axis=1).astype(jnp.int32)
         q_seq_lengths = jnp.minimum(kv_seq_lengths, q.shape[1])
         return jax.nn.dot_product_attention(
@@ -48,7 +50,14 @@ def dot_product_attention(
             implementation="cudnn",
         )
 
-    # CPU/TPU fallback
+    # CPU/TPU fallback, and GPU fallback for models whose head size is not
+    # accepted by cuDNN flash attention.
     return jax.nn.dot_product_attention(
-        q, k, v, scale=scale, mask=attention_mask[:, None, None, :].astype(bool), is_causal=is_causal
+        q,
+        k,
+        v,
+        scale=scale,
+        mask=attention_mask[:, None, None, :].astype(bool),
+        is_causal=is_causal,
+        implementation="xla",
     )
