@@ -110,7 +110,7 @@ setsid uv run --no-sync --extra fsdp vllm serve \
   --enable-lora \
   --max-loras 1 \
   --max-lora-rank 64 \
-  --max-model-len 1024 \
+  --max-model-len 4096 \
   --dtype bfloat16 \
   > logs/qwen35_2b_vllm.log 2>&1 < /dev/null &
 ```
@@ -215,7 +215,7 @@ model-specific settings.
 
 Memory notes from the 4B local runs:
 
-- vLLM had enough headroom on GPU 3, so do not use the most aggressive vLLM memory reductions by default. Start with `--max-model-len 2048`, `--max-loras 2`, and no `--enforce-eager`; reduce these only if the sampling server itself OOMs.
+- vLLM had enough headroom on GPU 3, so do not use the most aggressive vLLM memory reductions by default. Start with `--max-model-len 4096`, `--max-loras 2`, and no `--enforce-eager`; reduce these only if the sampling server itself OOMs.
 - Keep Tinker at the smallest workable adapter pool. `max_lora_adapters=1` can reject client creation in this setup, so use `2` rather than a larger value.
 - Keep `train_micro_batch_size=1`, `sample_max_num_sequences=8`, `gradient_checkpointing=true`, and `loss_chunk_size=128`.
 - Keep `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` so JAX does not grab the entire card up front.
@@ -236,7 +236,7 @@ setsid uv run --no-sync --extra fsdp vllm serve \
   --enable-lora \
   --max-loras 2 \
   --max-lora-rank 64 \
-  --max-model-len 2048 \
+  --max-model-len 4096 \
   --dtype bfloat16 \
   > logs/qwen35_4b_vllm.log 2>&1 < /dev/null &
 ```
@@ -294,7 +294,7 @@ Memory notes from the 9B local runs:
 - With multimodal disabled, `max-loras=4` at rank 64 fits alongside the 19.1 GB
   model weights on a 32 GB card (~29.3 GB total). Without it, even
   `max-loras=2` OOMs.
-- Keep `max-model-len=1024` and the default `max-num-seqs`. No
+- Keep `max-model-len=4096` and the default `max-num-seqs`. No
   `--enforce-eager` or reduced `--gpu-memory-utilization` needed once
   multimodal is disabled.
 - Trainer side: `tensor_parallel_size=2`, `fully_sharded_data_parallel_size=1`,
@@ -318,7 +318,7 @@ setsid uv run --no-sync --extra fsdp vllm serve \
   --enable-lora \
   --max-loras 4 \
   --max-lora-rank 64 \
-  --max-model-len 1024 \
+  --max-model-len 4096 \
   --dtype bfloat16 \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   > logs/qwen35_9b_vllm.log 2>&1 < /dev/null &
@@ -363,3 +363,21 @@ $PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
 $PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
   -c "CREATE DATABASE skyrl_tinker;"
 ```
+
+## 9. Attention backend (hardware note)
+
+Qwen3.5's `head_dim=256` exceeds cuDNN flash attention's **128** head-dim cap on
+Ampere/Ada (e.g. the RTX 5000 Ada / sm_89 box here), so `dot_product_attention`
+falls back off cuDNN: the causal prefill/training path uses Pallas/Triton, the
+non-causal decode path uses XLA.
+
+The cap is set at launch via `SKYRL_CUDNN_MAX_HEAD_DIM` (read by
+`skyrl/tx/layers/attention.py`, default **128**). The operator picks the value by
+GPU — there is no auto-detection:
+
+- **Ampere/Ada (sm_89 and earlier):** leave unset (128); uses the Pallas/XLA
+  fallback. Setting 256 here is rejected by JAX with
+  `NotImplementedError: head dim must be <= 128` — confirmed empirically.
+- **Hopper (sm_90)+:** export `SKYRL_CUDNN_MAX_HEAD_DIM=256` on the §8
+  training-server launch so head_dim=256 runs the native cuDNN kernel (faster
+  than XLA, skips the Pallas path).
