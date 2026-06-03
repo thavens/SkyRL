@@ -17,6 +17,8 @@ class ModelConfig(PretrainedConfig):
         loss_chunk_size: Chunk size for cross-entropy loss computation (0 = no chunking)
         gradient_checkpointing: Recompute activations during backward to save memory
         mhc_expansion_rate: mHC expansion rate. Connectors are trainable when this is > 1.
+        linear_attention_chunk_size: Chunk size (tokens) for the chunked gated-delta-rule
+            used by Qwen3.5 linear-attention layers during prefill/training.
     """
 
     # Type hints for config attributes
@@ -26,6 +28,7 @@ class ModelConfig(PretrainedConfig):
     loss_chunk_size: int
     gradient_checkpointing: bool
     mhc_expansion_rate: int
+    linear_attention_chunk_size: int
 
     def __init__(
         self,
@@ -37,6 +40,7 @@ class ModelConfig(PretrainedConfig):
         loss_chunk_size: int = 0,
         gradient_checkpointing: bool = False,
         mhc_expansion_rate: int = 1,
+        linear_attention_chunk_size: int = 64,
     ):
         # Preserve the source config's attribute_map (e.g. Qwen3MoeConfig's
         # num_experts -> num_local_experts alias) — transformers v5.4 made
@@ -52,6 +56,7 @@ class ModelConfig(PretrainedConfig):
         self.loss_chunk_size = loss_chunk_size
         self.gradient_checkpointing = gradient_checkpointing
         self.mhc_expansion_rate = mhc_expansion_rate
+        self.linear_attention_chunk_size = linear_attention_chunk_size
 
         # super().__init__ setattrs every key from config_dict, which would
         # silently overwrite the attributes set above on any overlap.
@@ -93,6 +98,7 @@ class ModelConfig(PretrainedConfig):
             loss_chunk_size=self.loss_chunk_size,
             gradient_checkpointing=self.gradient_checkpointing,
             mhc_expansion_rate=self.mhc_expansion_rate,
+            linear_attention_chunk_size=self.linear_attention_chunk_size,
         )
 
     def get_num_experts(self):

@@ -104,6 +104,11 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
         default=1024,
         description="Chunk size for cross-entropy loss computation. Reduces memory by avoiding full [B*T, V] logits materialization. Set to 0 to disable chunking.",
     )
+    linear_attention_chunk_size: int = Field(
+        default=64,
+        gt=0,
+        description="Chunk size (tokens) for the chunked gated-delta-rule in Qwen3.5 linear-attention layers during prefill/training. Smaller values reduce the per-pass memory transient at the cost of more sequential steps.",
+    )
     # Multi-node configuration
     coordinator_address: str | None = Field(
         default=None,
@@ -229,6 +234,7 @@ class JaxBackendImpl(AbstractBackend):
             loss_chunk_size=config.loss_chunk_size,
             gradient_checkpointing=config.gradient_checkpointing,
             mhc_expansion_rate=config.mhc_expansion_rate,
+            linear_attention_chunk_size=config.linear_attention_chunk_size,
         )
 
         model_class = get_model_class(self.model_config)

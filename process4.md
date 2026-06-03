@@ -108,7 +108,7 @@ setsid uv run --no-sync --extra fsdp vllm serve \
   --tensor-parallel-size 1 \
   --port 8000 \
   --enable-lora \
-  --max-loras 1 \
+  --max-loras 2 \
   --max-lora-rank 64 \
   --max-model-len 4096 \
   --dtype bfloat16 \
@@ -142,7 +142,7 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   --external-inference-lora-base /tmp/qwen35_2b_jax_settings_lora_models \
   --checkpoints-base /tmp/skyrl_qwen35_2b_jax_settings_checkpoints \
   --database-url 'postgresql://postgres@/skyrl_tinker?host=/tmp/skyrl_tinker_pg_data' \
-  --backend-config '{"max_lora_adapters":1,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true}' \
+  --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true}' \
   > logs/qwen35_2b_jax_settings_tinker.log 2>&1 < /dev/null &
 ```
 
@@ -153,6 +153,80 @@ until curl -fsS -m 5 http://localhost:8001/api/v1/get_server_capabilities >/dev/
   sleep 2
 done
 echo tinker_ok
+```
+
+## 4b. Diagnostic launch: identify the OOM op
+
+Use this instead of §4 when you need to find *which op* requested the failing
+allocation (e.g. the 26.93 GiB OOM at the seq_len=3072 train bucket). The extra
+env vars must be set at process start, so stop the trainer (§1) and relaunch
+with this block, then re-run the workload that triggers the OOM.
+
+Keep the **same `--backend-config` as the run that OOM'd** so it reproduces
+(the failing run used `loss_chunk_size:32`); only the env vars and the dump dir
+below are the diagnostic additions. If your client uses a different config, mirror
+that instead.
+
+It captures the culprit two ways:
+
+- **BFC allocator dump** → printed into `logs/qwen35_2b_jax_settings_tinker.log`
+  (`TF_CPP_MIN_LOG_LEVEL=0` + `TF_CPP_VMODULE=bfc_allocator=2` enable the full
+  per-bin / per-chunk summary, not just the truncated headline).
+- **XLA buffer-assignment dump** → written to `/tmp/skyrl_xla_dump`
+  (`--xla_dump_hlo_as_long_text` includes op metadata: op name + source file/line),
+  so the big buffer can be mapped back to the model code.
+
+```bash
+cd /scr1/michael/SkyRL
+mkdir -p logs
+
+# Fresh dump dir each run so we only see this run's modules
+rm -rf /tmp/skyrl_xla_dump && mkdir -p /tmp/skyrl_xla_dump
+
+CUDA_VISIBLE_DEVICES=0,1 \
+XLA_PYTHON_CLIENT_PREALLOCATE=false \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
+TF_CPP_MIN_LOG_LEVEL=0 \
+TF_CPP_VMODULE=bfc_allocator=2 \
+JAX_TRACEBACK_FILTERING=off \
+XLA_FLAGS="--xla_dump_to=/tmp/skyrl_xla_dump --xla_dump_hlo_as_long_text --xla_dump_hlo_as_text" \
+setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
+  -m skyrl.tinker.api \
+  --base-model /scr1/public_models/huggingface/Qwen/Qwen3.5-2B-Base \
+  --backend jax \
+  --port 8001 \
+  --external-inference-url http://localhost:8000 \
+  --external-inference-lora-base /tmp/qwen35_2b_jax_settings_lora_models \
+  --checkpoints-base /tmp/skyrl_qwen35_2b_jax_settings_checkpoints \
+  --database-url 'postgresql://postgres@/skyrl_tinker?host=/tmp/skyrl_tinker_pg_data' \
+  --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true,"loss_chunk_size":32}' \
+  > logs/qwen35_2b_jax_settings_tinker.log 2>&1 < /dev/null &
+```
+
+After it OOMs, pull out the culprit. The forward_backward module is the big
+one — find it, then read its largest buffer's **shape** (this alone settles
+logits vs attention) and map it to an op.
+
+```bash
+# 0. Allocator headline from the run (confirms the failing size)
+grep -nE "ran out of memory|requested by op|Sum Total|Bin \(" \
+  logs/qwen35_2b_jax_settings_tinker.log | tail -40
+
+# 1. The biggest module is the forward_backward graph
+ls -S /tmp/skyrl_xla_dump/*-memory-usage-report.txt | head
+
+# 2. Largest buffers first, WITH shapes. The ~27 GiB row's shape tells you what
+#    it is: f32[6144,248320]-ish => logits over the 248K vocab;
+#           f32[2,8,3072,3072]-ish => attention scores.
+head -15 "$(ls -S /tmp/skyrl_xla_dump/*-memory-usage-report.txt | head -1)"
+
+# 3. Map that shape/value back to an op + source line via buffer-assignment.
+#    Entries look like:
+#      allocation N: size SSSS, ...:
+#       value: <id op_name @k> (size=SSSS,offset=...): <shape>
+#    Find the allocation whose size is ~28.9e9 (28915510016) and read its op_name.
+BA="$(ls -S /tmp/skyrl_xla_dump/*-buffer-assignment.txt | head -1)"
+grep -nE "size (2[0-9]{10}|289155)" "$BA" | head     # ~27 GiB allocations
 ```
 
 ## 5. Verify
@@ -381,3 +455,73 @@ GPU — there is no auto-detection:
 - **Hopper (sm_90)+:** export `SKYRL_CUDNN_MAX_HEAD_DIM=256` on the §8
   training-server launch so head_dim=256 runs the native cuDNN kernel (faster
   than XLA, skips the Pallas path).
+
+## 10. 9B on the H100 box (multi-concurrent matrix)
+
+This section documents the server config that converged while running the
+InjecAgent matrix (up to 4 concurrent client runs, Qwen3.5-9B-Base attacker
+trained via Tinker) on the **3× H100 80GB modal box** — a different environment
+from §8 (which targets the local sm_89 / 32 GB RTX-5000 box). Differences:
+
+- **GPU split:** GPU 0,1 = JAX trainer (TP=2); **GPU 2** = vLLM (TP=1). Not GPU 3.
+- **sm_90 (Hopper):** `SKYRL_CUDNN_MAX_HEAD_DIM=256` so head_dim=256 runs native
+  cuDNN (per §9). The trainer launch exports it.
+- **Env quirks baked into the launch scripts:** `TMPDIR=/root/tmp`,
+  `UV_PROJECT_ENVIRONMENT=.venv-jax` (trainer), `VLLM_USE_DEEP_GEMM=0` (vLLM
+  0.20.2 crashes in DeepGEMM warmup otherwise), `HF_HUB_ENABLE_HF_TRANSFER=1`.
+- Launch via `/root/launch_tinker.sh` and `/root/launch_vllm.sh` (self-contained,
+  detached; each `pkill`s its own predecessor then re-execs).
+
+### Converged backend-config (trainer)
+
+```json
+{"max_lora_adapters":5,"max_lora_rank":64,"tensor_parallel_size":2,
+ "fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,
+ "sample_max_num_sequences":16,"gradient_checkpointing":true,"loss_chunk_size":64}
+```
+
+vLLM: `--max-loras 9 --max-num-seqs 512 --max-num-batched-tokens 16384
+--max-model-len 4096 --limit-mm-per-prompt '{"image":0,"video":0}'`.
+(`--max-loras` only needs to be `>=` the trainer's `max_lora_adapters`; 9 is
+harmless headroom over 5.)
+
+### Why each value (learned the hard way this run)
+
+- **`train_micro_batch_size=1`** — `=4` × padded InjecAgent sequence lengths made
+  the backward pass need 93.82 GiB on a single card → OOM. mb=1 peaks ~23 GiB
+  per pass. Do NOT raise it.
+- **`max_lora_adapters=5`** (⇒ at most **4 live adapters**; slot 0 is the base
+  model, a JAX-backend quirk). `=9` was a double mistake: (a) the JAX backend
+  stores LoRA grads as one tensor stacked over ALL slots
+  (`accumulated_grads = zeros_like(lora_params)`), so per-fwd_bwd grad memory +
+  the accum buffer scale with slot count — `=9` pinned ~66 GiB/GPU and OOM'd
+  4-concurrent; and (b) it slowed `forward_backward` to ~83–91 s (vs ~17–25 s at
+  5). `5` is the proven value: enough for 4 concurrent runs, small floor.
+- **`loss_chunk_size=64`** (down from 128) — halves the logits chunk, shrinking
+  the per-pass transient enough that 4 concurrent fwd_bwd fit under the
+  ~76 GiB/GPU usable cap. If 4-concurrent ever OOMs again, drop to 32.
+- **`sample_max_num_sequences=16`** (down from 64) — THE fix for the worst
+  failure. At 64, four concurrent runs (each `n_attacks=8`) admitted ~100+
+  concurrent sample sequences into vLLM, which wedged at **0 tokens/s**
+  (`"Running: 102 reqs, Avg generation throughput: 0.0 tokens/s"` in the vLLM
+  log). The trainer's `/load_lora_adapter` (external_inference.py) then hit a
+  300 s ReadTimeout and the SDK surfaced it to the client as an opaque
+  `400 {'detail': ''}` on a `SampleResponse` — which killed all 4 runs at once.
+  16 caps the per-cycle sampling burst so vLLM never wedges. If it recurs, drop
+  to 8 and/or throttle attacker sampling client-side.
+
+### Operational gotchas (cost us a full matrix)
+
+- **Crashed runs do NOT free trainer LoRA-adapter slots.** A dead client leaves
+  its adapter registered; with only 4 usable slots, every crash permanently
+  burns one until a **trainer restart**. So the goal is ZERO crashes — and if
+  the registry fills (`400 {'detail':'Maximum number of LoRA adapters (5)
+  reached'}`), bounce the trainer to reset it. The JAX OOMs return as 400s
+  without killing the trainer process, so the registry isn't auto-cleaned.
+- **vLLM never unloads sampler adapters.** external_inference.py loads a fresh
+  ephemeral LoRA per checkpoint and never calls `/unload`, so vLLM accumulates
+  them (saw 25). Bounce vLLM periodically (it also clears any sampling stall).
+- **Restart playbook:** bouncing the trainer resets the JAX allocator
+  high-water (it does NOT drop on its own after an OOM) and clears zombie
+  adapter slots; vLLM can stay up unless it has wedged or accumulated too many
+  adapters, in which case bounce it too. Cap client concurrency at **4**.
