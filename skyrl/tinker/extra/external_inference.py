@@ -51,6 +51,11 @@ class ExternalInferenceClient:
         self.lora_base_dir = engine_config.external_inference_lora_base
         self.db_engine = db_engine
 
+    # Transient failures worth retrying. Other HTTP errors (4xx) are
+    # deterministic (bad request, adapter registry full) and are surfaced to
+    # the client instead of retried.
+    _RETRYABLE_STATUS = (408, 429, 500, 502, 503, 504)
+
     async def call_and_store_result(
         self,
         request_id: int,
@@ -60,22 +65,46 @@ class ExternalInferenceClient:
         *,
         base_model: str | None = None,
     ):
-        """Background task to call external engine and store result in database."""
-        try:
-            async with httpx.AsyncClient(
-                base_url=self.base_url,
-                headers={"Authorization": f"Bearer {self.api_key}"},
-                timeout=httpx.Timeout(300.0, connect=10.0),  # 5 minutes for inference, 10s for connect
-            ) as http_client:
-                result = await self._forward_to_engine(
-                    sample_req, model_id, checkpoint_id, http_client, base_model=base_model
+        """Background task to call external engine and store result in database.
+
+        Timeouts, connection errors, and retryable HTTP statuses are retried
+        with exponential backoff until the request succeeds; only
+        non-retryable errors mark the future FAILED. The read timeout must
+        stay well above the engine's worst-case queue drain: a timeout
+        disconnects the request, which makes vLLM abort it, so a too-short
+        timeout turns a slow request into an infinite retry loop.
+        """
+        attempt = 0
+        while True:
+            attempt += 1
+            try:
+                async with httpx.AsyncClient(
+                    base_url=self.base_url,
+                    headers={"Authorization": f"Bearer {self.api_key}"},
+                    timeout=httpx.Timeout(1800.0, connect=10.0),
+                ) as http_client:
+                    result = await self._forward_to_engine(
+                        sample_req, model_id, checkpoint_id, http_client, base_model=base_model
+                    )
+                result_data = result.model_dump()
+                status = RequestStatus.COMPLETED
+                break
+            except Exception as e:
+                retryable = isinstance(e, (httpx.TimeoutException, httpx.TransportError)) or (
+                    isinstance(e, httpx.HTTPStatusError) and e.response.status_code in self._RETRYABLE_STATUS
                 )
-            result_data = result.model_dump()
-            status = RequestStatus.COMPLETED
-        except Exception as e:
-            logger.exception("External engine error")
-            result_data = {"error": str(e), "status": "failed"}
-            status = RequestStatus.FAILED
+                if retryable:
+                    delay = min(2**attempt, 60)
+                    logger.warning(
+                        f"External engine request {request_id} attempt {attempt} failed "
+                        f"({type(e).__name__}: {e}); retrying in {delay}s"
+                    )
+                    await asyncio.sleep(delay)
+                    continue
+                logger.exception("External engine error")
+                result_data = {"error": f"{type(e).__name__}: {e}", "status": "failed"}
+                status = RequestStatus.FAILED
+                break
 
         async with AsyncSession(self.db_engine) as session:
             future = await session.get(FutureDB, request_id)

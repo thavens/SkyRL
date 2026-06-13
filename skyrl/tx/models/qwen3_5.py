@@ -5,7 +5,7 @@ import math
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.sharding import NamedSharding, PartitionSpec, get_abstract_mesh, get_mesh
 
 from skyrl.tx.layers.attention import dot_product_attention
 from skyrl.tx.layers.lora import FusedLoRALinear, LoRAEmbed, LoRALinear
@@ -374,7 +374,25 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.chunk_size = config.linear_attention_chunk_size
 
-        # Keep linear-attention projections replicated across TP for simplicity/stability.
+        tp = get_abstract_mesh().shape.get("tp", 1)
+        if config.shard_attention_heads:
+            assert self.num_v_heads % tp == 0, f"num_v_heads={self.num_v_heads} must be divisible by tp={tp}"
+            assert self.num_k_heads % tp == 0, f"num_k_heads={self.num_k_heads} must be divisible by tp={tp}"
+        self.tp_shard = "tp" if config.shard_attention_heads else None
+        # Capture the construction-time mesh as concrete NamedShardings so __call__ can constrain
+        # the per-head delta-rule activations even with no mesh in context (e.g. eager test
+        # forwards). A NamedSharding needs no active mesh at call time; a bare PartitionSpec does.
+        if self.tp_shard is not None:
+            mesh = get_mesh()
+            self.head_sharding = NamedSharding(mesh, PartitionSpec(None, None, self.tp_shard, None))  # [B, T, H, D]
+            self.seq_sharding = NamedSharding(mesh, PartitionSpec(None, None, self.tp_shard))  # [B, T, H]
+        else:
+            self.head_sharding = None
+            self.seq_sharding = None
+
+        # in_proj_qkv and conv1d_weight pack q/k/v contiguously with unequal head counts, so they
+        # can't be split cleanly by head — keep them replicated across TP. Everything else
+        # (z/b/a/dt_bias/A_log/out_proj) plus the per-head delta-rule activations shards by head.
         self.in_proj_qkv = LoRALinear(
             self.hidden_size,
             self.conv_dim,
@@ -390,7 +408,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.in_proj_z = LoRALinear(
             self.hidden_size,
             self.value_dim,
-            sharding=("fsdp", None),
+            sharding=("fsdp", self.tp_shard),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -402,7 +420,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.in_proj_b = LoRALinear(
             self.hidden_size,
             self.num_v_heads,
-            sharding=("fsdp", None),
+            sharding=("fsdp", self.tp_shard),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -414,7 +432,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.in_proj_a = LoRALinear(
             self.hidden_size,
             self.num_v_heads,
-            sharding=("fsdp", None),
+            sharding=("fsdp", self.tp_shard),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -436,7 +454,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.dt_bias = Param(
             self.num_v_heads,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.ones_init(), (None,)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.ones_init(), (self.tp_shard,)),
             rngs=rngs,
         )
         self.A_log = Param(
@@ -446,7 +464,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
                 lambda key, shape, dtype: jnp.log(
                     jax.random.uniform(key, shape, dtype=dtype, minval=1e-3, maxval=16.0)
                 ),
-                (None,),
+                (self.tp_shard,),
             ),
             rngs=rngs,
         )
@@ -455,7 +473,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.out_proj = LoRALinear(
             self.value_dim,
             self.hidden_size,
-            sharding=(None, "fsdp"),
+            sharding=(self.tp_shard, "fsdp"),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -536,6 +554,18 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             repeats = self.num_v_heads // self.num_k_heads
             query = jnp.repeat(query, repeats, axis=2)
             key = jnp.repeat(key, repeats, axis=2)
+
+        # query/key/value come from the replicated in_proj_qkv->conv, so XLA won't reliably push
+        # head-sharding into the scan + triangular_solve. Constrain them (and z/g/beta) onto the
+        # head axis so the recurrent state and chunk intermediates split per device; out_proj
+        # all-reduces. replicated -> sharded here is free (each device drops the other heads' slice).
+        if self.head_sharding is not None:
+            query = jax.lax.with_sharding_constraint(query, self.head_sharding)
+            key = jax.lax.with_sharding_constraint(key, self.head_sharding)
+            value = jax.lax.with_sharding_constraint(value, self.head_sharding)
+            z = jax.lax.with_sharding_constraint(z, self.head_sharding)
+            g = jax.lax.with_sharding_constraint(g, self.seq_sharding)
+            beta = jax.lax.with_sharding_constraint(beta, self.seq_sharding)
 
         # Use chunked version for prefill (better parallelization), recurrent for decode
         if seq_len > 1:
@@ -747,56 +777,64 @@ class Qwen3_5TextModel(nnx.Module):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
-            if remat_layers:
-                graphdef, state = nnx.split(layer)
-                hidden_states = _remat_decoder_layer(
-                    graphdef, state, hidden_states, attention_mask, positions, adapter_indices
-                )
-                continue
+            # Tag every layer's ops with a unique scope so the XLA buffer-assignment /
+            # memory-usage dumps (see process4.md §4b) attribute the largest buffer to a
+            # specific layer index + type instead of collapsing onto the shared call site.
+            with jax.named_scope(f"layer_{layer_idx}_{self.layer_types[layer_idx]}"):
+                if remat_layers:
+                    graphdef, state = nnx.split(layer)
+                    hidden_states = _remat_decoder_layer(
+                        graphdef, state, hidden_states, attention_mask, positions, adapter_indices
+                    )
+                    continue
 
-            has_cache = kv_cache is not None
-            has_conv_cache = has_cache and kv_cache.conv_states is not None and kv_cache.recurrent_states is not None
+                has_cache = kv_cache is not None
+                has_conv_cache = (
+                    has_cache and kv_cache.conv_states is not None and kv_cache.recurrent_states is not None
+                )
 
-            if self.layer_types[layer_idx] == "full_attention":
-                layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx]) if has_cache else None
-                hidden_states, updated_kv, _, _ = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    positions=positions,
-                    adapter_indices=adapter_indices,
-                    kv_cache=layer_kv,
-                )
-                assert updated_kv is not None
-                updated_keys.append(updated_kv[0])
-                updated_values.append(updated_kv[1])
-                updated_conv_states.append(
-                    kv_cache.conv_states[layer_idx] if has_conv_cache else jnp.zeros((batch_size, 0, 0), dtype=dtype)
-                )
-                updated_recurrent_states.append(
-                    kv_cache.recurrent_states[layer_idx]
-                    if has_conv_cache
-                    else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
-                )
-            else:
-                conv_state = kv_cache.conv_states[layer_idx] if has_conv_cache else None
-                recurrent_state = kv_cache.recurrent_states[layer_idx] if has_conv_cache else None
-                hidden_states, _, new_conv_state, new_recurrent_state = layer(
-                    hidden_states,
-                    attention_mask=None if has_cache else attention_mask,
-                    positions=positions,
-                    adapter_indices=adapter_indices,
-                    conv_state=conv_state,
-                    recurrent_state=recurrent_state,
-                )
-                assert new_conv_state is not None and new_recurrent_state is not None
-                updated_conv_states.append(new_conv_state)
-                updated_recurrent_states.append(new_recurrent_state)
-                updated_keys.append(
-                    kv_cache.keys[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
-                )
-                updated_values.append(
-                    kv_cache.values[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
-                )
+                if self.layer_types[layer_idx] == "full_attention":
+                    layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx]) if has_cache else None
+                    hidden_states, updated_kv, _, _ = layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        positions=positions,
+                        adapter_indices=adapter_indices,
+                        kv_cache=layer_kv,
+                    )
+                    assert updated_kv is not None
+                    updated_keys.append(updated_kv[0])
+                    updated_values.append(updated_kv[1])
+                    updated_conv_states.append(
+                        kv_cache.conv_states[layer_idx]
+                        if has_conv_cache
+                        else jnp.zeros((batch_size, 0, 0), dtype=dtype)
+                    )
+                    updated_recurrent_states.append(
+                        kv_cache.recurrent_states[layer_idx]
+                        if has_conv_cache
+                        else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
+                    )
+                else:
+                    conv_state = kv_cache.conv_states[layer_idx] if has_conv_cache else None
+                    recurrent_state = kv_cache.recurrent_states[layer_idx] if has_conv_cache else None
+                    hidden_states, _, new_conv_state, new_recurrent_state = layer(
+                        hidden_states,
+                        attention_mask=None if has_cache else attention_mask,
+                        positions=positions,
+                        adapter_indices=adapter_indices,
+                        conv_state=conv_state,
+                        recurrent_state=recurrent_state,
+                    )
+                    assert new_conv_state is not None and new_recurrent_state is not None
+                    updated_conv_states.append(new_conv_state)
+                    updated_recurrent_states.append(new_recurrent_state)
+                    updated_keys.append(
+                        kv_cache.keys[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
+                    )
+                    updated_values.append(
+                        kv_cache.values[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
+                    )
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:

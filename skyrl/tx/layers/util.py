@@ -5,6 +5,63 @@ from jax import numpy as jnp
 from jax.sharding import PartitionSpec, get_abstract_mesh
 
 
+def _ragged_contract(a: jax.Array, b: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    """Grouped contraction over the (sorted, contiguous) token dimension — the LoRA weight gradient.
+
+    ``out[g, p, q] = sum_{t in group g} a[t, p] * b[t, q]``; ``a:[m, p]``, ``b:[m, q]`` -> ``[G, p, q]``.
+
+    The obvious spelling — ``ragged_dot_general`` with the token dim as the *contracting*
+    ragged dim — is exactly what XLA's autodiff transpose of ``ragged_dot`` already emits,
+    and on GPU it lowers to a ``[G, m, p]`` densification (one masked copy of the activations
+    per group/adapter slot) that dominates LoRA fwd/bwd memory. Instead we ``fori_loop`` over
+    the (few) groups, masking ``a`` to one group per iteration and reusing a single ``[m, p]``
+    buffer. The loop lowers to an HLO while-loop, which XLA does not vectorize back into
+    ``[G, m, p]`` — so peak backward memory no longer scales with the adapter count.
+    """
+    num_groups = group_sizes.shape[0]
+    m, p = a.shape
+    q = b.shape[1]
+    bounds = jnp.cumulative_sum(group_sizes, include_initial=True)
+    tok = jnp.arange(m)
+
+    def body(g, acc):
+        mask = ((tok >= bounds[g]) & (tok < bounds[g + 1])).astype(a.dtype)
+        return acc.at[g].set((a * mask[:, None]).T @ b)
+
+    return lax.fori_loop(0, num_groups, body, jnp.zeros((num_groups, p, q), a.dtype))
+
+
+@jax.custom_vjp
+def _ragged_dot_grouped_grad(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array) -> jax.Array:
+    """``lax.ragged_dot`` whose backward keeps the weight gradient ragged.
+
+    Forward is identical to ``lax.ragged_dot``. The difference is the VJP: XLA's default
+    transpose of ``ragged_dot`` w.r.t. the grouped ``rhs`` densifies to
+    ``[num_groups, num_tokens, features]`` — for LoRA, one masked copy of the activations
+    *per adapter slot*, which dominates fwd/bwd memory and makes it scale with
+    ``max_lora_adapters``. Here the weight gradient goes through ``_ragged_contract`` instead,
+    so backward memory no longer scales with the adapter count; ``d_lhs`` stays a cheap ragged_dot.
+
+    ``group_sizes`` is a traced integer array (bincount of adapter indices), so it must be a
+    regular arg (not ``nondiff_argnums``); bwd returns a ``None`` cotangent for it.
+    """
+    return lax.ragged_dot(lhs, rhs, group_sizes)
+
+
+def _ragged_dot_grouped_grad_fwd(lhs, rhs, group_sizes):
+    return lax.ragged_dot(lhs, rhs, group_sizes), (lhs, rhs, group_sizes)
+
+
+def _ragged_dot_grouped_grad_bwd(res, g):
+    lhs, rhs, group_sizes = res  # lhs:[m, k], rhs:[G, k, n], cotangent g:[m, n]
+    d_lhs = lax.ragged_dot(g, jnp.swapaxes(rhs, -1, -2), group_sizes)  # [m, k] (cheap ragged_dot)
+    d_rhs = _ragged_contract(lhs, g, group_sizes)  # [G, k, n] (no per-group densification)
+    return d_lhs, d_rhs, None  # None cotangent for the integer group_sizes
+
+
+_ragged_dot_grouped_grad.defvjp(_ragged_dot_grouped_grad_fwd, _ragged_dot_grouped_grad_bwd)
+
+
 def ragged_dot(
     lhs: jax.Array,
     rhs: jax.Array,
@@ -19,6 +76,11 @@ def ragged_dot(
     Tokens outside this range are routed to boundary groups and masked to zero.
     """
     if group_offset is None:
+        # Memory-efficient backward (no per-group densification) for the common LoRA path.
+        # precision / preferred_element_type are unused by the LoRA callers; if ever set,
+        # fall back to plain ragged_dot (whose autodiff transpose densifies).
+        if precision is None and preferred_element_type is None:
+            return _ragged_dot_grouped_grad(lhs, rhs, group_sizes)
         return lax.ragged_dot(
             lhs,
             rhs,

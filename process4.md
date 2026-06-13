@@ -13,6 +13,18 @@ Default model:
 /scr1/public_models/huggingface/Qwen/Qwen3.5-2B-Base
 ```
 
+State directory. All local server state (pgdata, checkpoints, LoRA adapters,
+XLA dumps, logs) lives under `$STATE_DIR`, which resolves to
+`/storage_slow/michael` when that per-user dir is writable (large slow disk)
+and falls back to `/tmp` otherwise. (The `/storage_slow` root itself is
+root-owned and not user-writable, so we use the per-user subdir.)
+Every bash block below recomputes it locally so each block stays
+copy-paste-standalone:
+
+```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
+```
+
 ## 1. Stop Existing Servers
 
 ```bash
@@ -41,19 +53,28 @@ use its binaries — **never run a Python script that imports `pgserver` against
 this pgdata while Postgres is up**. `pgserver` registers an `atexit` handler
 that SIGTERMs the postmaster on script exit even when `cleanup_mode=None`.
 
-Paths:
+Paths (with `STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)`):
 
 ```text
-PGDATA:   /tmp/skyrl_tinker_pg_data
-SOCKET:   /tmp/skyrl_tinker_pg_data/.s.PGSQL.5432
+STATE_DIR: /storage_slow/michael if writable, else /tmp
+PGDATA:   $STATE_DIR/skyrl_tinker_pg_data
+SOCKET:   $STATE_DIR/skyrl_tinker_pg_data/.s.PGSQL.5432
 DBNAME:   skyrl_tinker
 PG_BIN:   /scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
-PG_URL:   postgresql://postgres@/skyrl_tinker?host=/tmp/skyrl_tinker_pg_data
+PG_URL:   postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data
 ```
+
+**Note:** `$STATE_DIR` must resolve to the same path across launch, verify, and
+clean blocks (and across server restarts) — otherwise the trainer points at a
+different pgdata/database. As long as `/storage_slow` is mounted consistently
+this is stable; if you create the cluster on `/tmp` and `/storage_slow` later
+appears, the §2a one-time setup must be re-run on the new location.
 
 ### 2a. One-time setup (only if pgdata does not exist)
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
+
 # Install pgserver into the venv (one-time)
 cd /scr1/michael/SkyRL
 uv pip install pgserver
@@ -61,19 +82,19 @@ uv pip install pgserver
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
 # initdb a fresh cluster
-mkdir -p /tmp/skyrl_tinker_pg_data
-$PG_BIN/initdb -D /tmp/skyrl_tinker_pg_data -U postgres --auth=trust
+mkdir -p $STATE_DIR/skyrl_tinker_pg_data
+$PG_BIN/initdb -D $STATE_DIR/skyrl_tinker_pg_data -U postgres --auth=trust
 
 # Start it (see 2b)
-nohup setsid $PG_BIN/pg_ctl -D /tmp/skyrl_tinker_pg_data \
-  -l /tmp/skyrl_tinker_pg_data/log \
-  -o "-h '' -k /tmp/skyrl_tinker_pg_data" start \
-  </dev/null >/tmp/pg_start.log 2>&1
+nohup setsid $PG_BIN/pg_ctl -D $STATE_DIR/skyrl_tinker_pg_data \
+  -l $STATE_DIR/skyrl_tinker_pg_data/log \
+  -o "-h '' -k $STATE_DIR/skyrl_tinker_pg_data" start \
+  </dev/null >$STATE_DIR/pg_start.log 2>&1
 
 # Create the tinker database (idempotent)
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
   -tAc "SELECT 1 FROM pg_database WHERE datname='skyrl_tinker'" | grep -q 1 \
-  || $PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+  || $PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
        -c "CREATE DATABASE skyrl_tinker;"
 ```
 
@@ -83,16 +104,17 @@ migration step is needed.
 ### 2b. Start (idempotent — safe to run on every launch)
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
-$PG_BIN/pg_ctl -D /tmp/skyrl_tinker_pg_data status >/dev/null 2>&1 || \
-nohup setsid $PG_BIN/pg_ctl -D /tmp/skyrl_tinker_pg_data \
-  -l /tmp/skyrl_tinker_pg_data/log \
-  -o "-h '' -k /tmp/skyrl_tinker_pg_data" start \
-  </dev/null >/tmp/pg_start.log 2>&1
+$PG_BIN/pg_ctl -D $STATE_DIR/skyrl_tinker_pg_data status >/dev/null 2>&1 || \
+nohup setsid $PG_BIN/pg_ctl -D $STATE_DIR/skyrl_tinker_pg_data \
+  -l $STATE_DIR/skyrl_tinker_pg_data/log \
+  -o "-h '' -k $STATE_DIR/skyrl_tinker_pg_data" start \
+  </dev/null >$STATE_DIR/pg_start.log 2>&1
 
-$PG_BIN/pg_ctl -D /tmp/skyrl_tinker_pg_data status
-ls /tmp/skyrl_tinker_pg_data/.s.PGSQL.5432 && echo pg_ok
+$PG_BIN/pg_ctl -D $STATE_DIR/skyrl_tinker_pg_data status
+ls $STATE_DIR/skyrl_tinker_pg_data/.s.PGSQL.5432 && echo pg_ok
 ```
 
 ## 3. Launch 2B Sampling Server
@@ -130,6 +152,8 @@ echo vllm_ok
 cd /scr1/michael/SkyRL
 mkdir -p logs
 
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
+
 CUDA_VISIBLE_DEVICES=0,1 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
@@ -139,9 +163,9 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base /tmp/qwen35_2b_jax_settings_lora_models \
-  --checkpoints-base /tmp/skyrl_qwen35_2b_jax_settings_checkpoints \
-  --database-url 'postgresql://postgres@/skyrl_tinker?host=/tmp/skyrl_tinker_pg_data' \
+  --external-inference-lora-base $STATE_DIR/qwen35_2b_jax_settings_lora_models \
+  --checkpoints-base $STATE_DIR/skyrl_qwen35_2b_jax_settings_checkpoints \
+  --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true}' \
   > logs/qwen35_2b_jax_settings_tinker.log 2>&1 < /dev/null &
 ```
@@ -172,7 +196,7 @@ It captures the culprit two ways:
 - **BFC allocator dump** → printed into `logs/qwen35_2b_jax_settings_tinker.log`
   (`TF_CPP_MIN_LOG_LEVEL=0` + `TF_CPP_VMODULE=bfc_allocator=2` enable the full
   per-bin / per-chunk summary, not just the truncated headline).
-- **XLA buffer-assignment dump** → written to `/tmp/skyrl_xla_dump`
+- **XLA buffer-assignment dump** → written to `$STATE_DIR/skyrl_xla_dump`
   (`--xla_dump_hlo_as_long_text` includes op metadata: op name + source file/line),
   so the big buffer can be mapped back to the model code.
 
@@ -180,8 +204,10 @@ It captures the culprit two ways:
 cd /scr1/michael/SkyRL
 mkdir -p logs
 
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
+
 # Fresh dump dir each run so we only see this run's modules
-rm -rf /tmp/skyrl_xla_dump && mkdir -p /tmp/skyrl_xla_dump
+rm -rf $STATE_DIR/skyrl_xla_dump && mkdir -p $STATE_DIR/skyrl_xla_dump
 
 CUDA_VISIBLE_DEVICES=0,1 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
@@ -189,16 +215,16 @@ XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
 TF_CPP_MIN_LOG_LEVEL=0 \
 TF_CPP_VMODULE=bfc_allocator=2 \
 JAX_TRACEBACK_FILTERING=off \
-XLA_FLAGS="--xla_dump_to=/tmp/skyrl_xla_dump --xla_dump_hlo_as_long_text --xla_dump_hlo_as_text" \
+XLA_FLAGS="--xla_dump_to=$STATE_DIR/skyrl_xla_dump --xla_dump_hlo_as_long_text --xla_dump_hlo_as_text" \
 setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   -m skyrl.tinker.api \
   --base-model /scr1/public_models/huggingface/Qwen/Qwen3.5-2B-Base \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base /tmp/qwen35_2b_jax_settings_lora_models \
-  --checkpoints-base /tmp/skyrl_qwen35_2b_jax_settings_checkpoints \
-  --database-url 'postgresql://postgres@/skyrl_tinker?host=/tmp/skyrl_tinker_pg_data' \
+  --external-inference-lora-base $STATE_DIR/qwen35_2b_jax_settings_lora_models \
+  --checkpoints-base $STATE_DIR/skyrl_qwen35_2b_jax_settings_checkpoints \
+  --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true,"loss_chunk_size":32}' \
   > logs/qwen35_2b_jax_settings_tinker.log 2>&1 < /dev/null &
 ```
@@ -208,34 +234,37 @@ one — find it, then read its largest buffer's **shape** (this alone settles
 logits vs attention) and map it to an op.
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
+
 # 0. Allocator headline from the run (confirms the failing size)
 grep -nE "ran out of memory|requested by op|Sum Total|Bin \(" \
   logs/qwen35_2b_jax_settings_tinker.log | tail -40
 
 # 1. The biggest module is the forward_backward graph
-ls -S /tmp/skyrl_xla_dump/*-memory-usage-report.txt | head
+ls -S $STATE_DIR/skyrl_xla_dump/*-memory-usage-report.txt | head
 
 # 2. Largest buffers first, WITH shapes. The ~27 GiB row's shape tells you what
 #    it is: f32[6144,248320]-ish => logits over the 248K vocab;
 #           f32[2,8,3072,3072]-ish => attention scores.
-head -15 "$(ls -S /tmp/skyrl_xla_dump/*-memory-usage-report.txt | head -1)"
+head -15 "$(ls -S $STATE_DIR/skyrl_xla_dump/*-memory-usage-report.txt | head -1)"
 
 # 3. Map that shape/value back to an op + source line via buffer-assignment.
 #    Entries look like:
 #      allocation N: size SSSS, ...:
 #       value: <id op_name @k> (size=SSSS,offset=...): <shape>
 #    Find the allocation whose size is ~28.9e9 (28915510016) and read its op_name.
-BA="$(ls -S /tmp/skyrl_xla_dump/*-buffer-assignment.txt | head -1)"
+BA="$(ls -S $STATE_DIR/skyrl_xla_dump/*-buffer-assignment.txt | head -1)"
 grep -nE "size (2[0-9]{10}|289155)" "$BA" | head     # ~27 GiB allocations
 ```
 
 ## 5. Verify
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
 pgrep -af '[s]kyrl.tinker|[v]llm serve /scr1/public_models/huggingface/Qwen/Qwen3.5-'
-$PG_BIN/pg_ctl -D /tmp/skyrl_tinker_pg_data status | head -1
+$PG_BIN/pg_ctl -D $STATE_DIR/skyrl_tinker_pg_data status | head -1
 curl -fsS -m 5 http://localhost:8000/v1/models >/dev/null && echo vllm_ok
 curl -fsS -m 5 http://localhost:8001/api/v1/get_server_capabilities >/dev/null && echo tinker_ok
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
@@ -255,16 +284,17 @@ Stop the tinker server first (section 1) so nothing is holding open connections
 to the database:
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
 # On-disk artifacts
-rm -rf /tmp/qwen35_2b_jax_settings_lora_models
-rm -rf /tmp/skyrl_qwen35_2b_jax_settings_checkpoints
+rm -rf $STATE_DIR/qwen35_2b_jax_settings_lora_models
+rm -rf $STATE_DIR/skyrl_qwen35_2b_jax_settings_checkpoints
 
 # Drop + recreate the tinker database (clears all sessions, futures, checkpoints)
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
   -c "DROP DATABASE IF EXISTS skyrl_tinker;"
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
   -c "CREATE DATABASE skyrl_tinker;"
 ```
 
@@ -272,8 +302,9 @@ To unstick zombie `PENDING` futures without dropping everything (the most common
 case after an SDK timeout) — flip them to `FAILED` so the client unblocks:
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d skyrl_tinker -c "
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d skyrl_tinker -c "
 UPDATE futures
 SET status = 'FAILED',
     result_data = '{\"error\":\"Marked FAILED by operator\",\"status\":\"failed\"}',
@@ -289,11 +320,26 @@ model-specific settings.
 
 Memory notes from the 4B local runs:
 
-- vLLM had enough headroom on GPU 3, so do not use the most aggressive vLLM memory reductions by default. Start with `--max-model-len 4096`, `--max-loras 2`, and no `--enforce-eager`; reduce these only if the sampling server itself OOMs.
+- vLLM had enough headroom on GPU 3, so do not use the most aggressive vLLM memory reductions by default. Use `--max-model-len 8192`, `--max-loras 2`, and no `--enforce-eager`; reduce these only if the sampling server itself OOMs.
 - Keep Tinker at the smallest workable adapter pool. `max_lora_adapters=1` can reject client creation in this setup, so use `2` rather than a larger value.
 - Keep `train_micro_batch_size=1`, `sample_max_num_sequences=8`, `gradient_checkpointing=true`, and `loss_chunk_size=128`.
-- Keep `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95` so JAX does not grab the entire card up front.
+- Keep `XLA_PYTHON_CLIENT_PREALLOCATE=false` and `XLA_PYTHON_CLIENT_MEM_FRACTION=0.90`
+  so JAX does not grab the entire card up front. **Use 0.90, not 0.95**: CUDA
+  graph / XLA command-buffer instantiations are allocated by the driver *outside*
+  the JAX BFC pool, so they live in the non-reserved headroom. At 0.95 that
+  headroom (~1.6 GiB) is too thin — over a long run with many distinct seq-len
+  buckets, accumulated command buffers exhaust it and a graph re-instantiation
+  OOMs one TP rank, which desyncs the TP=2 collective and aborts the whole
+  process (exit 134, `cuda_command_buffer.cc: Retry CUDA graph instantiation
+  after OOM` → `rendezvous` termination). 0.90 leaves room for this. See the
+  2026-06-10 crash analysis.
 - Do not enable offloading by default. Use it only after the above settings still produce a real OOM.
+- **Train seq-len limit: the 4096 bucket.** Empirically (2026-06-09, this config):
+  buckets 1024/1536/2048/3072/4096 all compile and run (~160–170 s JIT each);
+  **6144 OOMs** (14.55 GiB alloc fails on both cards) even on a freshly
+  restarted trainer — a pure fit problem. Cap client sequences at ≤4096 raw
+  tokens (the next bucket above 4096 is 6144; see `round_up_seq_len`).
+  Test driver: `seq_len_limit_test.py` (repo root).
 
 Sampling server:
 
@@ -310,29 +356,41 @@ setsid uv run --no-sync --extra fsdp vllm serve \
   --enable-lora \
   --max-loras 2 \
   --max-lora-rank 64 \
-  --max-model-len 4096 \
+  --max-model-len 8192 \
   --dtype bfloat16 \
   > logs/qwen35_4b_vllm.log 2>&1 < /dev/null &
 ```
 
-Training server:
+Training server — **TP=2 on GPU 0,1** (GPU 0,1 are PCIe `PIX`, not NVLink).
+
+- **TP=2 is required.** Under FSDP=2/TP=1 the tied 248K `lm_head` logits are
+  replicated per card instead of vocab-sharded, which doubles the
+  `forward_backward` transient and OOMs the 4B. Do not use FSDP here.
+- **Do not enable the XLA latency-hiding scheduler**
+  (`--xla_gpu_enable_latency_hiding_scheduler`). It was tried to overlap the PCIe
+  TP all-reduces, but it extends buffer live-ranges and inflated the **startup**
+  memory high-water to ~16 GiB/card *before any step ran* — leaving no room for
+  `forward_backward`. Without it the floor sits at ~8.5 GiB/card. Accept the lower
+  GPU util; correctness/fit beats overlap on these 32 GB cards.
 
 ```bash
 cd /scr1/michael/SkyRL
 mkdir -p logs
 
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
+
 CUDA_VISIBLE_DEVICES=0,1 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
-XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
+XLA_PYTHON_CLIENT_MEM_FRACTION=0.90 \
 setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   -m skyrl.tinker.api \
   --base-model /scr1/public_models/huggingface/Qwen/Qwen3.5-4B-Base \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base /tmp/qwen35_4b_jax_settings_lora_models \
-  --checkpoints-base /tmp/skyrl_qwen35_4b_jax_settings_checkpoints \
-  --database-url 'postgresql://postgres@/skyrl_tinker?host=/tmp/skyrl_tinker_pg_data' \
+  --external-inference-lora-base $STATE_DIR/qwen35_4b_jax_settings_lora_models \
+  --checkpoints-base $STATE_DIR/skyrl_qwen35_4b_jax_settings_checkpoints \
+  --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":8,"gradient_checkpointing":true,"loss_chunk_size":128}' \
   > logs/qwen35_4b_jax_settings_tinker.log 2>&1 < /dev/null &
 ```
@@ -342,15 +400,16 @@ so dropping it clears 2B state too — only do this if you actually want a clean
 slate for the database side. The on-disk artifacts below are 4B-specific:
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
-rm -rf /tmp/qwen35_4b_jax_settings_lora_models
-rm -rf /tmp/skyrl_qwen35_4b_jax_settings_checkpoints
+rm -rf $STATE_DIR/qwen35_4b_jax_settings_lora_models
+rm -rf $STATE_DIR/skyrl_qwen35_4b_jax_settings_checkpoints
 
 # Optional: drop the shared tinker DB (affects 2B too)
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
   -c "DROP DATABASE IF EXISTS skyrl_tinker;"
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
   -c "CREATE DATABASE skyrl_tinker;"
 ```
 
@@ -404,6 +463,8 @@ Training server:
 cd /scr1/michael/SkyRL
 mkdir -p logs
 
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
+
 CUDA_VISIBLE_DEVICES=0,1 \
 XLA_PYTHON_CLIENT_PREALLOCATE=false \
 XLA_PYTHON_CLIENT_MEM_FRACTION=0.95 \
@@ -413,9 +474,9 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base /tmp/qwen35_9b_jax_settings_lora_models \
-  --checkpoints-base /tmp/skyrl_qwen35_9b_jax_settings_checkpoints \
-  --database-url 'postgresql://postgres@/skyrl_tinker?host=/tmp/skyrl_tinker_pg_data' \
+  --external-inference-lora-base $STATE_DIR/qwen35_9b_jax_settings_lora_models \
+  --checkpoints-base $STATE_DIR/skyrl_qwen35_9b_jax_settings_checkpoints \
+  --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":4,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":4,"gradient_checkpointing":true,"loss_chunk_size":128}' \
   > logs/qwen35_9b_jax_settings_tinker.log 2>&1 < /dev/null &
 ```
@@ -426,15 +487,16 @@ if you actually want a clean slate for the database side. The on-disk
 artifacts below are 9B-specific:
 
 ```bash
+STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
-rm -rf /tmp/qwen35_9b_jax_settings_lora_models
-rm -rf /tmp/skyrl_qwen35_9b_jax_settings_checkpoints
+rm -rf $STATE_DIR/qwen35_9b_jax_settings_lora_models
+rm -rf $STATE_DIR/skyrl_qwen35_9b_jax_settings_checkpoints
 
 # Optional: drop the shared tinker DB (affects 2B and 4B too)
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
   -c "DROP DATABASE IF EXISTS skyrl_tinker;"
-$PG_BIN/psql -h /tmp/skyrl_tinker_pg_data -U postgres -d postgres \
+$PG_BIN/psql -h $STATE_DIR/skyrl_tinker_pg_data -U postgres -d postgres \
   -c "CREATE DATABASE skyrl_tinker;"
 ```
 
