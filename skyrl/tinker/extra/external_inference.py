@@ -1,6 +1,5 @@
 import asyncio
 import errno
-import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -19,6 +18,15 @@ from skyrl.utils.storage import download_and_unpack
 def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None:
     """Extract a LoRA checkpoint to disk for vLLM to load.
 
+    The checkpoint is extracted onto ``target_dir``'s own filesystem (via
+    ``scratch_dir``), so publishing it is a single atomic ``rename``. This is
+    what prevents the load-time 404: a concurrent request racing to load the
+    same freshly-trained checkpoint either sees no ``target_dir`` or sees the
+    complete one, never a half-written directory. (The previous version
+    extracted into the system temp dir and, on the resulting cross-device
+    EXDEV, fell back to a non-atomic ``shutil.move`` straight into
+    ``target_dir`` that briefly exposed a partial directory -> 404.)
+
     This is a blocking operation (filesystem/network I/O) and should be called
     via asyncio.to_thread() to avoid blocking the event loop.
     """
@@ -27,14 +35,10 @@ def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None
     # Extract the checkpoint if it doesn't already exist
     if not target_dir.exists():
         try:
-            with download_and_unpack(checkpoint_path) as extracted_path:
-                try:
-                    extracted_path.rename(target_dir)
-                except OSError as e:
-                    if e.errno != errno.EXDEV:
-                        raise
-                    shutil.move(str(extracted_path), str(target_dir))
-        except (FileExistsError, OSError, shutil.Error) as e:
+            # Extract onto target_dir's filesystem so the rename below is atomic.
+            with download_and_unpack(checkpoint_path, scratch_dir=target_dir.parent) as extracted_path:
+                extracted_path.rename(target_dir)
+        except (FileExistsError, OSError) as e:
             # This could happen if two processes try to download the file.
             # In that case the other process won the race and created target_dir.
             if not target_dir.exists() or (isinstance(e, OSError) and e.errno not in (errno.EEXIST, errno.ENOTEMPTY)):
