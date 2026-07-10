@@ -134,7 +134,9 @@ class AbstractBackend(ABC):
         pass
 
     @abstractmethod
-    def save_sampler_checkpoint(self, output_path, model_id: str, persist: bool = True) -> None:
+    def save_sampler_checkpoint(
+        self, output_path, model_id: str, persist: bool = True, as_directory: bool = False
+    ) -> None:
         """Prepare model weights for sampling and optionally save to disk.
 
         Backends that use colocated inference engines should sync weights
@@ -143,10 +145,15 @@ class AbstractBackend(ABC):
         lightweight marker at ``output_path``.
 
         Args:
-            output_path: Path to save the checkpoint tar.gz file
+            output_path: Path to save the checkpoint to (a tar.gz file, or a
+                directory when ``as_directory`` is True)
             model_id: The model identifier
             persist: If True, write a full model snapshot to disk.
                      If False, only sync weights in-memory (hot path).
+            as_directory: If True, publish the adapter as a plain directory that
+                an external inference engine can load in place, skipping the tar
+                pack/un-tar round-trip. Backends that do not support this may
+                ignore it. Only the JAX backend acts on it.
         """
         pass
 

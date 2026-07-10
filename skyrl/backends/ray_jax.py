@@ -74,8 +74,10 @@ class RayJaxBackendImpl:
     def load_checkpoint(self, checkpoint_path: AnyPath, model_id: str) -> None:
         self.backend.load_checkpoint(checkpoint_path, model_id)
 
-    def save_sampler_checkpoint(self, output_path: AnyPath, model_id: str, persist: bool = True) -> None:
-        self.backend.save_sampler_checkpoint(output_path, model_id, persist)
+    def save_sampler_checkpoint(
+        self, output_path: AnyPath, model_id: str, persist: bool = True, as_directory: bool = False
+    ) -> None:
+        self.backend.save_sampler_checkpoint(output_path, model_id, persist, as_directory)
 
     def has_model(self, model_id: str) -> bool:
         return self.backend.has_model(model_id)
@@ -188,5 +190,7 @@ class RayJaxBackend(AbstractBackend):
     def save_checkpoint(self, output_path: AnyPath, model_id: str) -> None:
         ray.get([w.save_checkpoint.remote(output_path, model_id) for w in self.workers])
 
-    def save_sampler_checkpoint(self, output_path: AnyPath, model_id: str, persist: bool = True) -> None:
-        ray.get([w.save_sampler_checkpoint.remote(output_path, model_id, persist) for w in self.workers])
+    def save_sampler_checkpoint(
+        self, output_path: AnyPath, model_id: str, persist: bool = True, as_directory: bool = False
+    ) -> None:
+        ray.get([w.save_sampler_checkpoint.remote(output_path, model_id, persist, as_directory) for w in self.workers])

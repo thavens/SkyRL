@@ -25,6 +25,18 @@ copy-paste-standalone:
 STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 ```
 
+**Sampler LoRA adapters live on tmpfs.** `--external-inference-lora-base` is set to
+`/dev/shm/$USER/..._lora_models` (RAM-backed tmpfs), NOT `$STATE_DIR`. The JAX backend
+now writes each sampler adapter directly there as a plain directory that vLLM loads in
+place — no tar pack, no read-back, no un-tar (previously every
+`save_weights_and_get_sampling_client` wrote a tar to the slow disk and then re-extracted
+it). These adapters are transient (needed only until vLLM loads them), so tmpfs is ideal.
+Two caveats: (1) `/dev/shm` must be shared by the colocated trainer/API/vLLM — it is, on
+this single-node box; (2) vLLM never unloads adapters, so the dir grows in RAM until a
+vLLM bounce — keep bouncing vLLM periodically (see §10) and `rm -rf` the `/dev/shm/...`
+dir on restart. Durable training checkpoints still go to `--checkpoints-base` under
+`$STATE_DIR`.
+
 ## 1. Stop Existing Servers
 
 ```bash
@@ -163,7 +175,7 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base $STATE_DIR/qwen35_2b_jax_settings_lora_models \
+  --external-inference-lora-base /dev/shm/$USER/qwen35_2b_jax_settings_lora_models \
   --checkpoints-base $STATE_DIR/skyrl_qwen35_2b_jax_settings_checkpoints \
   --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true}' \
@@ -222,7 +234,7 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base $STATE_DIR/qwen35_2b_jax_settings_lora_models \
+  --external-inference-lora-base /dev/shm/$USER/qwen35_2b_jax_settings_lora_models \
   --checkpoints-base $STATE_DIR/skyrl_qwen35_2b_jax_settings_checkpoints \
   --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true,"loss_chunk_size":32}' \
@@ -288,7 +300,7 @@ STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
 # On-disk artifacts
-rm -rf $STATE_DIR/qwen35_2b_jax_settings_lora_models
+rm -rf /dev/shm/$USER/qwen35_2b_jax_settings_lora_models
 rm -rf $STATE_DIR/skyrl_qwen35_2b_jax_settings_checkpoints
 
 # Drop + recreate the tinker database (clears all sessions, futures, checkpoints)
@@ -388,7 +400,7 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base $STATE_DIR/qwen35_4b_jax_settings_lora_models \
+  --external-inference-lora-base /dev/shm/$USER/qwen35_4b_jax_settings_lora_models \
   --checkpoints-base $STATE_DIR/skyrl_qwen35_4b_jax_settings_checkpoints \
   --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":8,"gradient_checkpointing":true,"loss_chunk_size":128}' \
@@ -403,7 +415,7 @@ slate for the database side. The on-disk artifacts below are 4B-specific:
 STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
-rm -rf $STATE_DIR/qwen35_4b_jax_settings_lora_models
+rm -rf /dev/shm/$USER/qwen35_4b_jax_settings_lora_models
 rm -rf $STATE_DIR/skyrl_qwen35_4b_jax_settings_checkpoints
 
 # Optional: drop the shared tinker DB (affects 2B too)
@@ -474,7 +486,7 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   --backend jax \
   --port 8001 \
   --external-inference-url http://localhost:8000 \
-  --external-inference-lora-base $STATE_DIR/qwen35_9b_jax_settings_lora_models \
+  --external-inference-lora-base /dev/shm/$USER/qwen35_9b_jax_settings_lora_models \
   --checkpoints-base $STATE_DIR/skyrl_qwen35_9b_jax_settings_checkpoints \
   --database-url "postgresql://postgres@/skyrl_tinker?host=$STATE_DIR/skyrl_tinker_pg_data" \
   --backend-config '{"max_lora_adapters":4,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":4,"gradient_checkpointing":true,"loss_chunk_size":128}' \
@@ -490,7 +502,7 @@ artifacts below are 9B-specific:
 STATE_DIR=$([ -w /storage_slow/michael ] && echo /storage_slow/michael || echo /tmp)
 PG_BIN=/scr1/michael/SkyRL/.venv/lib/python3.12/site-packages/pgserver/pginstall/bin
 
-rm -rf $STATE_DIR/qwen35_9b_jax_settings_lora_models
+rm -rf /dev/shm/$USER/qwen35_9b_jax_settings_lora_models
 rm -rf $STATE_DIR/skyrl_qwen35_9b_jax_settings_checkpoints
 
 # Optional: drop the shared tinker DB (affects 2B and 4B too)

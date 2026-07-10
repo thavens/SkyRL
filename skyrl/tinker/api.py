@@ -45,7 +45,7 @@ from skyrl.tinker.extra import (
     SkyRLTrainInferenceForwardingClient,
 )
 from skyrl.utils.log import get_uvicorn_log_config, logger
-from skyrl.utils.storage import download_file
+from skyrl.utils.storage import read_as_archive
 
 # Validation patterns for train_run_ids, model_ids and checkpoint_ids
 ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -1183,8 +1183,20 @@ async def validate_checkpoint(
     if checkpoint_db.status == CheckpointStatus.FAILED:
         raise HTTPException(status_code=500, detail=f"Checkpoint creation failed: {checkpoint_db.error_message}")
 
+    cfg = request.app.state.engine_config
+    # JAX backend + external inference publishes sampler adapters as a plain
+    # directory under external_inference_lora_base (see engine.process_save_weights_for_sampler),
+    # not a tar.gz under checkpoints_base. Return that path so archive endpoints
+    # resolve to the artifact that actually exists.
+    if (
+        checkpoint_type == types.CheckpointType.SAMPLER
+        and cfg.backend == "jax"
+        and cfg.external_inference_url is not None
+    ):
+        return cfg.external_inference_lora_base / f"{unique_id}_{checkpoint_id}"
+
     subdir = "sampler_weights" if checkpoint_type == types.CheckpointType.SAMPLER else ""
-    return request.app.state.engine_config.checkpoints_base / unique_id / subdir / f"{checkpoint_id}.tar.gz"
+    return cfg.checkpoints_base / unique_id / subdir / f"{checkpoint_id}.tar.gz"
 
 
 @app.get("/api/v1/training_runs")
@@ -1256,7 +1268,7 @@ async def download_checkpoint_archive(
         request, unique_id, checkpoint_id, types.CheckpointType.SAMPLER, session
     )
 
-    file_buffer = await asyncio.to_thread(download_file, checkpoint_path)
+    file_buffer = await asyncio.to_thread(read_as_archive, checkpoint_path)
 
     filename = f"{unique_id}_{checkpoint_id}.tar.gz"
     headers = {

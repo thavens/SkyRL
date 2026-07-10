@@ -637,7 +637,6 @@ class TinkerEngine:
 
         # Make sure the user cannot store checkpoints in places like ../../<important file>
         checkpoint_id = Path(request_data.path).name
-        output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
         # When the caller provides a sampling_session_seq_id the save is
         # usually transient: colocated / backend-managed inference only needs
@@ -646,8 +645,22 @@ class TinkerEngine:
         # checkpoint archive and asking the external engine to load it.
         persist = self.config.external_inference_url is not None or request_data.sampling_session_seq_id is None
 
+        # For the JAX backend + external inference, write the adapter directly as
+        # a plain directory where the external engine loads it from
+        # (external_inference_lora_base/<model_id>_<checkpoint_id>), skipping the
+        # tar pack + read-back + un-tar round-trip that the external inference
+        # forwarder would otherwise do. The directory name matches the
+        # `model_name` that external_inference.py reconstructs, so the forwarder
+        # finds it already-published and loads it in place. Other backends (which
+        # ignore `as_directory`) and the non-external path keep the tar layout.
+        as_directory = self.config.backend == "jax" and self.config.external_inference_url is not None
+        if as_directory:
+            output_path = self.config.external_inference_lora_base / f"{model_id}_{checkpoint_id}"
+        else:
+            output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-            self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)
+            self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist, as_directory=as_directory)
             logger.info(f"Saved sampler checkpoint for model {model_id} to {output_path}")
 
         # Return path=None when using sampling_session_seq_id and seq_id (SDK expects this)

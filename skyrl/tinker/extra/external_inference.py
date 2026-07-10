@@ -140,12 +140,17 @@ class ExternalInferenceClient:
             # Base model sampling: use the model name directly, no LoRA checkpoint needed
             model_name = base_model
         else:
-            # LoRA sampling: extract checkpoint and reference it by name for dynamic loading
+            # LoRA sampling: reference the adapter by name for dynamic loading.
             model_name = f"{model_id}_{checkpoint_id}"
-            checkpoint_path = self.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
             target_dir = self.lora_base_dir / model_name
 
-            await asyncio.to_thread(_extract_checkpoint_sync, checkpoint_path, target_dir)
+            # The JAX backend + external inference writes the adapter directly to
+            # target_dir as a plain directory, so no extraction is needed. Fall
+            # back to extracting the tar.gz for any pre-existing/older sampler
+            # checkpoints (or backends that still write a tar).
+            if not target_dir.exists():
+                checkpoint_path = self.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+                await asyncio.to_thread(_extract_checkpoint_sync, checkpoint_path, target_dir)
             load_response = await http_client.post(
                 "/load_lora_adapter",
                 json={"lora_name": model_name, "lora_path": str(target_dir)},
