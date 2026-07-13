@@ -447,6 +447,11 @@ Memory notes from the 9B local runs:
   `gradient_checkpointing=true`, `loss_chunk_size=128`.
 - Keep `XLA_PYTHON_CLIENT_PREALLOCATE=false` and
   `XLA_PYTHON_CLIENT_MEM_FRACTION=0.95`.
+- **If the trainer SIGSEGVs (exit 139) during the TP=2 `forward_backward`
+  compile, add `NCCL_NET=Socket` to the training-server launch.** It's NCCL
+  2.28.9's net-transport auto-probe (`ncclNetPluginInit`) segfaulting, not the
+  SkyRL/Triton/LoRA stack — survives a clean reinstall and every config change.
+  Single-GPU compiles fine; only the 2-GPU collective crashes.
 
 Sampling server:
 
