@@ -47,6 +47,7 @@ from skyrl.tx.layers.connectors import is_connector_path
 from skyrl.tx.layers.lora import clear_lora_adapter, init_lora_adapter
 from skyrl.tx.models.configs import Qwen3Config
 from skyrl.tx.utils.models import (
+    compute_updated_adapter_state,
     extract_adapter_state,
     get_adapter_idx,
     get_dtype,
@@ -90,6 +91,14 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
     gradient_checkpointing: bool = Field(
         default=False,
         description="Per-layer activation checkpointing: recompute activations during backward to save memory",
+    )
+    train_pad_seq_len_to: int = Field(
+        default=0,
+        description=(
+            "Pad every forward/forward_backward batch to at least this sequence length so all train "
+            "steps share a single JIT bucket (one executable, stable allocation pattern); "
+            "0 means dynamic bucketing via round_up_seq_len"
+        ),
     )
     mhc_expansion_rate: int = Field(
         default=1,
@@ -208,6 +217,46 @@ class AccumulatedGradients:
         )
 
 
+@jax.tree_util.register_dataclass
+@dataclass
+class AdamState:
+    """Slot-masked AdamW moments shared across all LoRA adapters.
+
+    A single mu/nu pair (fp32, same stacked layout as the LoRA params) serves
+    every adapter: each optim step reads and writes only the stepping model's
+    adapter slot, so optimizer memory is fixed regardless of how many models
+    are created. A per-model ``nnx.Optimizer`` would instead allocate fp32
+    moments over the full max_lora_adapters-stacked tree per model, which
+    scales GPU memory with the number of concurrent training runs.
+    """
+
+    mu: nnx.State
+    nu: nnx.State
+    counts: jax.Array  # per-adapter step counts, used for bias correction
+
+    @classmethod
+    def create(cls, lora_params: nnx.State, max_adapters: int) -> "AdamState":
+        """Initialize with zeros (moments in fp32, like AccumulatedGradients)."""
+        return cls(
+            mu=jax.tree.map(lambda p: jnp.zeros_like(p, dtype=jnp.float32), lora_params),
+            nu=jax.tree.map(lambda p: jnp.zeros_like(p, dtype=jnp.float32), lora_params),
+            counts=jnp.zeros((max_adapters,), dtype=jnp.int32),
+        )
+
+    def reset_adapter(self, adapter_index: jax.Array) -> "AdamState":
+        """Zero the moments and step count for a specific adapter slot."""
+
+        def reset(path, m):
+            idx = get_adapter_idx(path, adapter_index)
+            return m.at[idx].set(0.0)
+
+        return AdamState(
+            mu=jax.tree.map_with_path(reset, self.mu),
+            nu=jax.tree.map_with_path(reset, self.nu),
+            counts=self.counts.at[adapter_index].set(0),
+        )
+
+
 class JaxBackendImpl(AbstractBackend):
     """JAX backend implementation for models with LoRA adapters.
 
@@ -269,11 +318,9 @@ class JaxBackendImpl(AbstractBackend):
             # Initialize adapter 0 with minimal config (required for base model sampling path)
             init_lora_adapter(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0, seed=0))
 
-            # Initialize global accumulated gradients
+            # Initialize global accumulated gradients and shared slot-masked optimizer state
             self.accumulated_grads = AccumulatedGradients.create(self.lora_params, config.max_lora_adapters)
-
-        # Per-model optimizer storage (managed internally)
-        self.optimizers: dict[str, nnx.Optimizer] = {}
+            self.adam_state = AdamState.create(self.lora_params, config.max_lora_adapters)
 
         # Store LoRA model metadata (model_id -> metadata)
         self.models: dict[str, types.ModelMetadata] = {}
@@ -541,14 +588,19 @@ class JaxBackendImpl(AbstractBackend):
                 out_shardings=(accumulated_grads_shardings, batch_sharded_2d, batch_sharded_2d),
             )
 
-        # JIT-compiled function to compute full gradients and apply optimizer update
+        # JIT-compiled function to compute full gradients and apply a slot-masked
+        # AdamW update to the stepping adapter only. Hyperparameters are traced
+        # scalars so per-request changes don't retrigger compilation, and the
+        # shared AdamState keeps optimizer memory independent of model count.
         def compute_grads_and_update(
             accumulated_grads: AccumulatedGradients,
             lora_params: nnx.State,
-            optimizer: nnx.Optimizer,
+            adam_state: AdamState,
+            hyperparams: tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array],
             adapter_index: jax.Array,
-        ) -> tuple[AccumulatedGradients, OptimStepMetrics]:
-            """Compute full gradients, apply optimizer update, and reset accumulated grads."""
+        ) -> tuple[AccumulatedGradients, nnx.State, AdamState, OptimStepMetrics]:
+            """Compute mean grads, apply AdamW to one adapter slot, reset accumulated grads."""
+            learning_rate, b1, b2, eps, weight_decay = hyperparams
             mean_grads = accumulated_grads.get_mean(adapter_index)
             grad_norm = optax.global_norm(mean_grads)
             mhc_gradient_norm = None
@@ -558,18 +610,64 @@ class JaxBackendImpl(AbstractBackend):
                     mean_grads,
                 )
                 mhc_gradient_norm = optax.global_norm(mhc_grads)
-            optimizer.update(lora_params, mean_grads)
+
+            # Matches optax.adamw: biased-corrected moments, then
+            # update = mu_hat / (sqrt(nu_hat) + eps) + weight_decay * p, scaled by -lr.
+            step = adam_state.counts[adapter_index] + 1
+            step_f = step.astype(jnp.float32)
+            bias_correction1 = 1.0 - b1**step_f
+            bias_correction2 = 1.0 - b2**step_f
+
+            def update_mu(path, mu, g):
+                idx = get_adapter_idx(path, adapter_index)
+                return mu.at[idx].set(b1 * mu[idx] + (1.0 - b1) * g[idx])
+
+            def update_nu(path, nu, g):
+                idx = get_adapter_idx(path, adapter_index)
+                return nu.at[idx].set(b2 * nu[idx] + (1.0 - b2) * g[idx] * g[idx])
+
+            new_mu = jax.tree.map_with_path(update_mu, adam_state.mu, mean_grads)
+            new_nu = jax.tree.map_with_path(update_nu, adam_state.nu, mean_grads)
+
+            def update_param(path, p, mu, nu):
+                idx = get_adapter_idx(path, adapter_index)
+                mu_hat = mu[idx] / bias_correction1
+                nu_hat = nu[idx] / bias_correction2
+                p_slot = p[idx].astype(jnp.float32)
+                update = mu_hat / (jnp.sqrt(nu_hat) + eps) + weight_decay * p_slot
+                return p.at[idx].set((p_slot - learning_rate * update).astype(p.dtype))
+
+            new_lora_params = jax.tree.map_with_path(update_param, lora_params, new_mu, new_nu)
+            new_adam_state = AdamState(
+                mu=new_mu,
+                nu=new_nu,
+                counts=adam_state.counts.at[adapter_index].set(step),
+            )
             metrics = OptimStepMetrics(
                 grad_norm=grad_norm,
-                learning_rate=optimizer.opt_state.hyperparams["learning_rate"],
+                learning_rate=learning_rate,
                 mhc_gradient_norm=mhc_gradient_norm,
             )
-            return accumulated_grads.reset_adapter(adapter_index), metrics
+            return accumulated_grads.reset_adapter(adapter_index), new_lora_params, new_adam_state, metrics
 
         if self.config.enforce_eager:
             self._compute_grads_and_update = compute_grads_and_update
         else:
-            self._compute_grads_and_update = nnx.jit(compute_grads_and_update)
+            optim_lora_shardings = jax.tree.map(
+                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.lora_params)
+            )
+            optim_accum_shardings = jax.tree.map(
+                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
+            )
+            adam_state_shardings = jax.tree.map(
+                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.adam_state)
+            )
+            self._compute_grads_and_update = jax.jit(
+                compute_grads_and_update,
+                in_shardings=(optim_accum_shardings, optim_lora_shardings, adam_state_shardings, None, None),
+                out_shardings=(optim_accum_shardings, optim_lora_shardings, adam_state_shardings, None),
+                donate_argnames=("accumulated_grads", "adam_state"),
+            )
 
     def has_model(self, model_id: str) -> bool:
         """Check if a model is registered with the backend."""
@@ -601,18 +699,11 @@ class JaxBackendImpl(AbstractBackend):
             lora_config=lora_config,
         )
 
-        # Create optimizer
-        # mu_dtype=fp32 keeps the Adam first moment in fp32 even though the LoRA
-        # params are bf16 (optax would otherwise init the moments at the param
-        # dtype). Pairs with the fp32 AccumulatedGradients buffer.
+        # Reset the shared optimizer slot for this adapter (the slot may have been
+        # used by a previously deleted model) and configure the adapter weights.
         with jax.set_mesh(self.mesh):
-            optimizer = optax.inject_hyperparams(optax.adamw, static_args=("mu_dtype",))(
-                learning_rate=0.0, mu_dtype=jnp.float32
-            )
-            self.optimizers[model_id] = nnx.Optimizer(self.model, optimizer, wrt=self.model.is_lora_param)
-
-        # Configure adapter
-        init_lora_adapter(self.model, adapter_index, lora_config)
+            self.adam_state = self.adam_state.reset_adapter(jnp.int32(adapter_index))
+            init_lora_adapter(self.model, adapter_index, lora_config)
         logger.info(f"Created model {model_id} with adapter_index={adapter_index}, config={lora_config}")
 
     def delete_model(self, model_id: str) -> None:
@@ -626,9 +717,8 @@ class JaxBackendImpl(AbstractBackend):
         # Clear LoRA adapter weights
         with jax.set_mesh(self.mesh):
             clear_lora_adapter(self.model, adapter_index)
-
-        # Delete optimizer
-        del self.optimizers[model_id]
+            # Zero the shared optimizer slot so a future model reusing it starts fresh
+            self.adam_state = self.adam_state.reset_adapter(jnp.int32(adapter_index))
 
         # Delete model metadata
         del self.models[model_id]
@@ -671,6 +761,9 @@ class JaxBackendImpl(AbstractBackend):
 
         # Pad sequences to same length. Also bin it so the JIT has to compile fewer kernels.
         max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids))
+        # Optionally pin to a single bucket so every train step reuses one executable and
+        # one allocation pattern (avoids per-bucket executables eating BFC headroom).
+        max_len = max(max_len, self.config.train_pad_seq_len_to)
 
         input_ids = pad_batch(all_input_ids, max_len, np.int32)
         target_ids = pad_batch(all_targets, max_len, np.int32)
@@ -818,29 +911,38 @@ class JaxBackendImpl(AbstractBackend):
     def optim_step(self, model_id: str, request_data: types.OptimStepInput) -> types.OptimStepOutput:
         """Apply an optimizer step using accumulated gradients."""
         adapter_index = self.models[model_id].adapter_index
-        optimizer = self.optimizers[model_id]
-        learning_rate = request_data.adam_params.learning_rate
+        adam_params = request_data.adam_params
 
         # Check if we have any gradients accumulated (count > 0)
         if self.accumulated_grads.counts[adapter_index] == 0:
             logger.warning(f"No accumulated gradients for model {model_id}; applying step with zero gradients")
 
-        # Update hyperparameters from the request
-        hp = optimizer.opt_state.hyperparams
-        hp["learning_rate"][...] = learning_rate
-        hp["b1"][...] = request_data.adam_params.beta1
-        hp["b2"][...] = request_data.adam_params.beta2
-        hp["eps"][...] = request_data.adam_params.eps
-        hp["weight_decay"][...] = request_data.adam_params.weight_decay
-
-        # JIT-compiled: compute full gradients, apply optimizer update, and reset accumulated grads
-        with jax.set_mesh(self.mesh):
-            self.accumulated_grads, optim_metrics = self._compute_grads_and_update(
-                self.accumulated_grads,
-                self.lora_params,
-                optimizer,
-                jnp.int32(adapter_index),
+        # Hyperparameters are traced scalars: per-request values don't retrigger compilation
+        hyperparams = tuple(
+            jnp.float32(v)
+            for v in (
+                adam_params.learning_rate,
+                adam_params.beta1,
+                adam_params.beta2,
+                adam_params.eps,
+                adam_params.weight_decay,
             )
+        )
+
+        # JIT-compiled: compute full gradients, apply slot-masked AdamW update, and reset accumulated grads
+        with jax.set_mesh(self.mesh):
+            self.accumulated_grads, new_lora_params, self.adam_state, optim_metrics = (
+                self._compute_grads_and_update(
+                    self.accumulated_grads,
+                    self.lora_params,
+                    self.adam_state,
+                    hyperparams,
+                    jnp.int32(adapter_index),
+                )
+            )
+            # Write the updated params back into the shared model Variables so
+            # self.model and self.lora_params stay coherent views.
+            nnx.update(self.lora_params, new_lora_params)
 
         output_metrics = jax.device_get(optim_metrics).to_output_metrics()
         logger.info(f"Applied optimizer step for model {model_id} (adapter {adapter_index}), metrics={output_metrics}")
@@ -955,7 +1057,11 @@ class JaxBackendImpl(AbstractBackend):
         adapter_index = self.models[model_id].adapter_index
         rank = self.models[model_id].lora_config.rank
         lora_weights = extract_adapter_state(adapter_index, self.lora_params, rank)
-        optimizer_state = extract_adapter_state(adapter_index, nnx.state(self.optimizers[model_id]), rank)
+        optimizer_state = {
+            "mu": extract_adapter_state(adapter_index, self.adam_state.mu, rank),
+            "nu": extract_adapter_state(adapter_index, self.adam_state.nu, rank),
+            "count": self.adam_state.counts[adapter_index],
+        }
         return {
             "lora_weights": lora_weights,
             "optimizer_state": optimizer_state,
@@ -974,8 +1080,11 @@ class JaxBackendImpl(AbstractBackend):
             )
 
         insert_adapter_state(adapter_index, self.lora_params, checkpoint_data["lora_weights"], rank)
-        insert_adapter_state(
-            adapter_index, nnx.state(self.optimizers[model_id]), checkpoint_data["optimizer_state"], rank
+        optimizer_state = checkpoint_data["optimizer_state"]
+        self.adam_state = AdamState(
+            mu=compute_updated_adapter_state(adapter_index, self.adam_state.mu, optimizer_state["mu"], rank),
+            nu=compute_updated_adapter_state(adapter_index, self.adam_state.nu, optimizer_state["nu"], rank),
+            counts=self.adam_state.counts.at[adapter_index].set(jnp.int32(optimizer_state["count"])),
         )
 
     def load_checkpoint(self, checkpoint_path: AnyPath, model_id: str) -> None:

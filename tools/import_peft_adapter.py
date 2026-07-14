@@ -180,7 +180,7 @@ def main() -> None:
     print("  Placeholder checkpoint registered in DB.")
 
     tar_path = Path(args.checkpoints_base) / model_id / "sampler_weights" / f"{args.checkpoint_id}.tar.gz"
-    print(f"\nOverwriting {tar_path} with padded SecAlign weights...")
+    print(f"\nOverwriting {tar_path} with padded adapter weights...")
     if not tar_path.exists():
         print(f"  WARNING: placeholder tar not found at {tar_path}; writing anyway.")
     pack_tarball(padded, adapter_alpha, rank, base_name, tar_path)

@@ -147,7 +147,7 @@ Per-model settings (reasons in §7):
 | Model | `MEM_FRAC` | `BACKEND_CONFIG` |
 |-------|-----------|------------------|
 | 2B | 0.95 | `{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":1,"fully_sharded_data_parallel_size":2,"train_micro_batch_size":1,"sample_max_num_sequences":16,"gradient_checkpointing":true}` |
-| 4B | 0.90 | `{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":8,"gradient_checkpointing":true,"loss_chunk_size":128}` |
+| 4B | 0.90 | `{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":8,"gradient_checkpointing":true,"loss_chunk_size":128,"train_pad_seq_len_to":4096}` |
 | 9B | 0.95 | `{"max_lora_adapters":4,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":4,"gradient_checkpointing":true,"loss_chunk_size":128}` |
 
 ```bash
@@ -156,13 +156,14 @@ STATE_DIR=$([ -w /storage_slow/$USER ] && echo /storage_slow/$USER || echo /tmp)
 TAG=4b
 MODEL=/scr1/public_models/huggingface/Qwen/Qwen3.5-4B-Base
 MEM_FRAC=0.90
-BACKEND_CONFIG='{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":8,"gradient_checkpointing":true,"loss_chunk_size":128}'
+BACKEND_CONFIG='{"max_lora_adapters":2,"max_lora_rank":64,"tensor_parallel_size":2,"fully_sharded_data_parallel_size":1,"train_micro_batch_size":1,"sample_max_num_sequences":8,"gradient_checkpointing":true,"loss_chunk_size":128,"train_pad_seq_len_to":4096}'
 
 cd $REPO && mkdir -p logs
 
 CUDA_VISIBLE_DEVICES=0,1 \
-XLA_PYTHON_CLIENT_PREALLOCATE=false \
+XLA_PYTHON_CLIENT_PREALLOCATE=true \
 XLA_PYTHON_CLIENT_MEM_FRACTION=$MEM_FRAC \
+JAX_COMPILATION_CACHE_DIR=$STATE_DIR/skyrl_jax_compilation_cache \
 NCCL_NET=Socket \
 setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
   -m skyrl.tinker.api \
@@ -179,6 +180,16 @@ setsid uv run --active --no-sync --extra gpu --extra tinker --extra jax \
 until curl -fsS -m 5 http://localhost:8001/api/v1/get_server_capabilities >/dev/null; do sleep 2; done
 echo tinker_ok
 ```
+
+`JAX_COMPILATION_CACHE_DIR` enables JAX's persistent compilation cache: each
+seq-len bucket costs ~160–170 s of XLA JIT (§7), and trainer bounces are routine
+(§11 — adapter-slot cleanup, allocator reset), so without the cache every
+restart re-pays the full compile ladder. With it, the first launch populates
+the cache and later restarts reload compiled executables in seconds. The cache
+key includes the jax version, GPU type, and XLA flags — upgrading jax or adding
+the §8 debug `XLA_FLAGS` just misses the cache and recompiles (safe). The dir
+grows slowly; it is safe to `rm -rf` anytime. Do NOT put it on `/dev/shm`
+(it must survive reboots to be useful).
 
 `NCCL_NET=Socket` works around NCCL 2.28.9's net-transport auto-probe
 (`ncclNetPluginInit`) segfaulting on any 2-GPU collective on this box — it is
@@ -264,6 +275,35 @@ SELECT status, COUNT(*) FROM futures GROUP BY status;"
   alloc fails on both cards) even freshly restarted — a pure fit problem. Cap
   client sequences at ≤4096 raw tokens (next bucket above 4096 is 6144; see
   `round_up_seq_len`). Test driver: `seq_len_limit_test.py` (repo root).
+- **Concurrent runs need the shared `AdamState` optimizer (2026-07-13 fix in
+  `skyrl/backends/jax.py`).** The stock backend allocated a separate
+  `nnx.Optimizer` per created model, each holding fp32 Adam moments over the
+  *entire* `max_lora_adapters`-stacked LoRA tree (~5–6 GiB/GPU per model at 5
+  slots × rank 64). fwd_bwd at the 4096 bucket needs a fixed ~9.94 GiB
+  workspace, so one model trained fine for hours but the moment a second
+  client created its model, the next 4096-shape step OOM'd (each per-model
+  optimizer also paid its own ~40 s optim JIT). The OOM wedges the engine:
+  JAX high-water never drops and every train op returns 400 RESOURCE_EXHAUSTED
+  until a bounce. The fix replaces per-model optimizers with one shared
+  slot-masked `AdamState` (mu/nu allocated once, `optim_step` updates only the
+  stepping model's adapter slot — same pattern as `AccumulatedGradients`), so
+  optimizer memory is constant in the number of models: 4 concurrent rank-64
+  runs at 4096 verified passing. Note: full-state checkpoints saved before the
+  fix use the old `optimizer_state` layout and won't reload; sampler weight
+  checkpoints are unaffected.
+- **`XLA_PYTHON_CLIENT_PREALLOCATE=true`** (changed from `false`): reserves
+  MEM_FRAC as one contiguous slab at startup, so a big allocation can always
+  be carved from coalesced free space (with `false`, the pool grows as
+  multiple regions that cannot coalesce across region boundaries). Safe
+  because GPUs 0,1 are dedicated to the trainer. Not sufficient on its own —
+  the per-model optimizer bug above OOM'd either way — but keeps the ~10 GiB
+  fwd_bwd workspace robust to fragmentation.
+- **Pin the train bucket: `"train_pad_seq_len_to":4096`** (knob in
+  `JaxBackendConfig`). Pads every fwd/fwd_bwd batch to 4096 so there is exactly
+  one train executable and one allocation pattern: slower on short batches, but
+  avoids per-bucket executables eating headroom and keeps step memory
+  shape-invariant across any number of concurrent runs (fwd_bwd is serialized
+  by the engine, so concurrency does not multiply the transient).
 - `max_lora_adapters=1` can reject client creation; use 2. vLLM on GPU 3 has
   headroom, so keep `--max-model-len 8192` and no `--enforce-eager`; reduce
   only if the sampling server itself OOMs.
@@ -355,6 +395,9 @@ from the local box:
   0.20.2 crashes in DeepGEMM warmup otherwise), `HF_HUB_ENABLE_HF_TRANSFER=1`.
 - Launch via `/root/launch_tinker.sh` and `/root/launch_vllm.sh`
   (self-contained, detached; each `pkill`s its own predecessor, then re-execs).
+- Add `JAX_COMPILATION_CACHE_DIR` (§4) to `launch_tinker.sh` there too —
+  restarts are even more frequent on that box (adapter-slot cleanup after
+  crashed matrix runs).
 
 Trainer backend-config:
 

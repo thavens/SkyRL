@@ -107,8 +107,8 @@ def download_and_unpack(source: AnyPath, scratch_dir: Optional[Path] = None) -> 
         tmp_path = Path(tmp)
 
         # Download and extract tar archive (handles both local and cloud storage).
-        # Some local sampler checkpoints use an uncompressed tar for speed while
-        # retaining the historical .tar.gz suffix.
+        # "r:*" auto-detects compression, tolerating both gzip archives and any
+        # plain tars that may exist on disk under the historical .tar.gz suffix.
         with source.open("rb") as f:
             with tarfile.open(fileobj=f, mode="r:*") as tar:
                 tar.extractall(tmp_path, filter="data")
