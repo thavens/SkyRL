@@ -100,6 +100,18 @@ class JaxBackendConfig(BaseModel, extra="forbid"):
             "0 means dynamic bucketing via round_up_seq_len"
         ),
     )
+    train_bucket_seq_len_per_micro_batch: bool = Field(
+        default=False,
+        description=(
+            "Pad each micro-batch to its own rounded-up sequence length instead of to the max over "
+            "the whole batch. With mixed-length data the global max makes every short sequence pay "
+            "for the longest one in the batch, which dominates cost when the batch is padded to a "
+            "large fixed length. Each bucket is always <= the length the non-bucketed path would "
+            "use, so peak memory never increases; the cost is one JIT executable per distinct "
+            "bucket (bounded by round_up_seq_len's ~2-significant-bit binning, and cached on disk "
+            "via JAX_COMPILATION_CACHE_DIR). Takes precedence over train_pad_seq_len_to."
+        ),
+    )
     mhc_expansion_rate: int = Field(
         default=1,
         ge=1,
@@ -759,91 +771,105 @@ class JaxBackendImpl(AbstractBackend):
         # Convert model_ids to adapter_indices
         all_adapter_indices = [self.models[model_id].adapter_index for model_id in prepared_batch.all_model_ids]
 
+        seq_lens = [len(seq) for seq in all_input_ids]
+        total_bs = len(all_input_ids)
+        micro_bs = self._micro_batch_size(total_bs)
+
+        # The padded length has to cover every per-token array, not just input_ids.
+        pad_lens = [
+            max(
+                len(all_input_ids[i]),
+                len(all_targets[i]),
+                len(all_token_weights[i]),
+                len(all_sampling_logprobs[i]),
+                len(all_advantages[i]),
+            )
+            for i in range(total_bs)
+        ]
+
         # Pad sequences to same length. Also bin it so the JIT has to compile fewer kernels.
-        max_len = round_up_seq_len(max(len(seq) for seq in all_input_ids))
         # Optionally pin to a single bucket so every train step reuses one executable and
         # one allocation pattern (avoids per-bucket executables eating BFC headroom).
-        max_len = max(max_len, self.config.train_pad_seq_len_to)
+        global_max_len = max(round_up_seq_len(max(pad_lens)), self.config.train_pad_seq_len_to)
+        # Or bucket per micro-batch, so a short sequence does not pay for the longest one in
+        # the batch. Each bucket is <= global_max_len, so peak memory never increases.
+        bucket_per_micro_batch = self.config.train_bucket_seq_len_per_micro_batch
 
-        input_ids = pad_batch(all_input_ids, max_len, np.int32)
-        target_ids = pad_batch(all_targets, max_len, np.int32)
+        attention_masks = [[1] * n for n in seq_lens]
         adapter_indices = np.array(all_adapter_indices, dtype=np.int32)
         loss_fn_types = np.array(all_loss_fn_types, dtype=np.int32)
         loss_fn_config = self._build_loss_fn_config(all_loss_fn_configs)
 
-        # Create attention mask (1 for real tokens, 0 for padding)
-        attention_mask = pad_batch([[1] * len(seq) for seq in all_input_ids], max_len, np.int32)
-        loss_mask = pad_batch(all_token_weights, max_len, np.float32)
-        sampling_logprobs = pad_batch(all_sampling_logprobs, max_len, np.float32)
-        advantages = pad_batch(all_advantages, max_len, np.float32)
-
-        total_bs = int(input_ids.shape[0])
-        micro_bs = self._micro_batch_size(total_bs)
-        seq_lens = [len(seq) for seq in all_input_ids]
-
         # Collect full padded arrays on device, slice after transfer
         token_losses_device = []
         logprobs_device = []
-        seq_len = input_ids.shape[1]
 
         # Sharding specs for batch inputs
         sharding_2d = jax.NamedSharding(self.mesh, jax.P("fsdp", None))
         sharding_1d = jax.NamedSharding(self.mesh, jax.P("fsdp"))
         fsdp_size = self.mesh.shape["fsdp"]
 
-        with jax.set_mesh(self.mesh), self._jit_timing_context(seq_len, mode="train"):
+        with jax.set_mesh(self.mesh):
             for mb_start in range(0, total_bs, micro_bs):
                 mb_end = min(mb_start + micro_bs, total_bs)
 
-                # Pad and shard the micro-batch inputs
-                (
-                    mb_input_ids,
-                    mb_attention_mask,
-                    mb_target_ids,
-                    mb_loss_mask,
-                    mb_sampling_logprobs,
-                    mb_advantages,
-                    mb_adapter_indices,
-                    mb_loss_fn_types,
-                    mb_clip_low_threshold,
-                    mb_clip_high_threshold,
-                ) = jax.device_put(
-                    (
-                        pad_to_fsdp(input_ids[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(attention_mask[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(target_ids[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(loss_mask[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(sampling_logprobs[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(advantages[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(adapter_indices[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(loss_fn_types[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(loss_fn_config.clip_low_threshold[mb_start:mb_end], fsdp_size),
-                        pad_to_fsdp(loss_fn_config.clip_high_threshold[mb_start:mb_end], fsdp_size),
-                    ),
-                    (sharding_2d,) * 6 + (sharding_1d,) * 4,
-                )
-                mb_loss_fn_config = LossFnConfig(
-                    clip_low_threshold=mb_clip_low_threshold,
-                    clip_high_threshold=mb_clip_high_threshold,
-                )
+                if bucket_per_micro_batch:
+                    mb_len = round_up_seq_len(max(pad_lens[mb_start:mb_end]))
+                else:
+                    mb_len = global_max_len
 
-                self.accumulated_grads, per_token_losses, target_logprobs = model_pass_fn(
-                    self.accumulated_grads,
-                    self.lora_params,
-                    self.non_lora_params,
-                    mb_input_ids,
-                    mb_attention_mask,
-                    mb_adapter_indices,
-                    mb_target_ids,
-                    mb_loss_mask,
-                    mb_loss_fn_types,
-                    mb_sampling_logprobs,
-                    mb_advantages,
-                    mb_loss_fn_config,
-                )
-                # Slice back to original size (remove FSDP padding)
-                token_losses_device.append(per_token_losses[: mb_end - mb_start])
-                logprobs_device.append(target_logprobs[: mb_end - mb_start])
+                with self._jit_timing_context(mb_len, mode="train"):
+                    # Pad and shard the micro-batch inputs
+                    (
+                        mb_input_ids,
+                        mb_attention_mask,
+                        mb_target_ids,
+                        mb_loss_mask,
+                        mb_sampling_logprobs,
+                        mb_advantages,
+                        mb_adapter_indices,
+                        mb_loss_fn_types,
+                        mb_clip_low_threshold,
+                        mb_clip_high_threshold,
+                    ) = jax.device_put(
+                        (
+                            pad_to_fsdp(pad_batch(all_input_ids[mb_start:mb_end], mb_len, np.int32), fsdp_size),
+                            pad_to_fsdp(pad_batch(attention_masks[mb_start:mb_end], mb_len, np.int32), fsdp_size),
+                            pad_to_fsdp(pad_batch(all_targets[mb_start:mb_end], mb_len, np.int32), fsdp_size),
+                            pad_to_fsdp(pad_batch(all_token_weights[mb_start:mb_end], mb_len, np.float32), fsdp_size),
+                            pad_to_fsdp(
+                                pad_batch(all_sampling_logprobs[mb_start:mb_end], mb_len, np.float32), fsdp_size
+                            ),
+                            pad_to_fsdp(pad_batch(all_advantages[mb_start:mb_end], mb_len, np.float32), fsdp_size),
+                            pad_to_fsdp(adapter_indices[mb_start:mb_end], fsdp_size),
+                            pad_to_fsdp(loss_fn_types[mb_start:mb_end], fsdp_size),
+                            pad_to_fsdp(loss_fn_config.clip_low_threshold[mb_start:mb_end], fsdp_size),
+                            pad_to_fsdp(loss_fn_config.clip_high_threshold[mb_start:mb_end], fsdp_size),
+                        ),
+                        (sharding_2d,) * 6 + (sharding_1d,) * 4,
+                    )
+                    mb_loss_fn_config = LossFnConfig(
+                        clip_low_threshold=mb_clip_low_threshold,
+                        clip_high_threshold=mb_clip_high_threshold,
+                    )
+
+                    self.accumulated_grads, per_token_losses, target_logprobs = model_pass_fn(
+                        self.accumulated_grads,
+                        self.lora_params,
+                        self.non_lora_params,
+                        mb_input_ids,
+                        mb_attention_mask,
+                        mb_adapter_indices,
+                        mb_target_ids,
+                        mb_loss_mask,
+                        mb_loss_fn_types,
+                        mb_sampling_logprobs,
+                        mb_advantages,
+                        mb_loss_fn_config,
+                    )
+                    # Slice back to original size (remove FSDP padding)
+                    token_losses_device.append(per_token_losses[: mb_end - mb_start])
+                    logprobs_device.append(target_logprobs[: mb_end - mb_start])
 
         # Gather results from all hosts before device_get
         if jax.process_count() > 1:
