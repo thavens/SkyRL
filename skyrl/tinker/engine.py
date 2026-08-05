@@ -239,6 +239,32 @@ class TinkerEngine:
 
         return results, valid_requests
 
+    @staticmethod
+    def _validate_backend_config(config: EngineConfig, backend_config) -> None:
+        """Resolve the sampling route into the backend config, and reject unsafe combinations.
+
+        JAX slot 0 is the zeroed "no LoRA" adapter that base-model sampling routes to. When an
+        external inference server owns sampling, the backend's sampling path is never exercised,
+        so that slot would sit idle holding weights and fp32 optimizer state; the backend hands
+        it to user models instead and all max_lora_adapters slots become usable. This is derived
+        here rather than trusted from --backend-config: releasing the slot while base-model
+        sampling can still reach this backend would silently sample through a trained adapter.
+
+        Without external inference slot 0 stays reserved and N slots serve N-1 models, so
+        max_lora_adapters=1 leaves nothing to allocate and every create_model would fail.
+        """
+        if config.backend != "jax":
+            return
+        external = config.external_inference_url is not None
+        backend_config.external_inference = external
+        if backend_config.max_lora_adapters == 1 and not external:
+            raise ValueError(
+                "max_lora_adapters=1 with no external inference server leaves no usable adapter "
+                "slot: slot 0 stays reserved for base-model sampling, so every create_model "
+                "would fail. Set --external-inference-url to route sampling away from this "
+                "backend and reclaim slot 0, or raise max_lora_adapters to 2."
+            )
+
     def __init__(
         self,
         config: EngineConfig,
@@ -252,6 +278,7 @@ class TinkerEngine:
         use_ray = config.backend_config.get("use_ray", False)
         backend_class, backend_config_class = get_backend_classes(config.backend, use_ray=use_ray)
         backend_config = backend_config_class(**config.backend_config)
+        self._validate_backend_config(config, backend_config)
         self.backend = backend_class(config.base_model, backend_config)
 
         # Backends that support async sample routing notify us when their
@@ -645,19 +672,13 @@ class TinkerEngine:
         # checkpoint archive and asking the external engine to load it.
         persist = self.config.external_inference_url is not None or request_data.sampling_session_seq_id is None
 
-        # For the JAX backend + external inference, write the adapter directly as
-        # a plain directory where the external engine loads it from
-        # (external_inference_lora_base/<model_id>_<checkpoint_id>), skipping the
-        # tar pack + read-back + un-tar round-trip that the external inference
-        # forwarder would otherwise do. The directory name matches the
-        # `model_name` that external_inference.py reconstructs, so the forwarder
-        # finds it already-published and loads it in place. Other backends (which
-        # ignore `as_directory`) and the non-external path keep the tar layout.
-        as_directory = self.config.backend == "jax" and self.config.external_inference_url is not None
+        # Publish the adapter where the forwarder expects to find it. See
+        # EngineConfig.publishes_sampler_adapter_in_place for why the two layouts exist.
+        as_directory = self.config.publishes_sampler_adapter_in_place
         if as_directory:
-            output_path = self.config.external_inference_lora_base / f"{model_id}_{checkpoint_id}"
+            output_path = self.config.sampler_adapter_dir(model_id, checkpoint_id)
         else:
-            output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+            output_path = self.config.sampler_archive_path(model_id, checkpoint_id)
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
             self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist, as_directory=as_directory)

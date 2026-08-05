@@ -89,6 +89,71 @@ def test_max_adapters_limit():
         _ = create_model(backend, "model_overflow")
 
 
+def test_single_adapter_releases_base_slot():
+    """With external inference, max_lora_adapters=1 hands slot 0 to the user model."""
+    backend = create_backend(max_lora_adapters=1, external_inference=True)
+
+    assert backend.first_adapter_index == 0
+    assert create_model(backend, "model_1") == 0
+
+    # The single slot is now taken.
+    with pytest.raises(ValueError, match="Maximum number of LoRA adapters"):
+        _ = create_model(backend, "model_2")
+
+    # Deleting frees it again, and it is still slot 0.
+    backend.delete_model("model_1")
+    assert create_model(backend, "model_2") == 0
+
+
+def test_external_inference_releases_base_slot_at_every_size():
+    """Slot 0 is released whenever sampling is external, so N slots serve N models."""
+    for n in (1, 2, MAX_LORA_ADAPTERS):
+        backend = create_backend(max_lora_adapters=n, external_inference=True)
+        assert backend.first_adapter_index == 0
+        # every slot is allocatable, starting at 0
+        assert [create_model(backend, f"model_{i}") for i in range(n)] == list(range(n))
+        with pytest.raises(ValueError, match="Maximum number of LoRA adapters"):
+            _ = create_model(backend, "model_overflow")
+
+
+def test_base_slot_reserved_without_external_inference():
+    """Without external inference slot 0 stays reserved, so N slots serve N-1 models."""
+    for n in (1, 2, MAX_LORA_ADAPTERS):
+        assert create_backend(max_lora_adapters=n).first_adapter_index == 1
+
+    backend = create_backend(max_lora_adapters=MAX_LORA_ADAPTERS)
+    assert create_model(backend, "model_1") == 1
+
+
+def test_engine_derives_external_inference_flag():
+    """The engine owns the flag: it is derived from the sampling route, never trusted as input."""
+    from skyrl.tinker.config import EngineConfig
+    from skyrl.tinker.engine import TinkerEngine
+
+    external = EngineConfig(base_model=BASE_MODEL, backend="jax", external_inference_url="http://127.0.0.1:8000")
+    local = EngineConfig(base_model=BASE_MODEL, backend="jax")
+
+    # max_lora_adapters=1 with no external server leaves zero usable slots -> refused.
+    with pytest.raises(ValueError, match="no usable adapter slot"):
+        TinkerEngine._validate_backend_config(local, JaxBackendConfig(max_lora_adapters=1, max_lora_rank=32))
+
+    # Allowed once sampling is routed elsewhere, and the flag is set for the backend.
+    cfg = JaxBackendConfig(max_lora_adapters=1, max_lora_rank=32)
+    TinkerEngine._validate_backend_config(external, cfg)
+    assert cfg.external_inference is True
+
+    # A spoofed value is overwritten rather than honoured -- releasing slot 0 while this
+    # backend still serves base-model sampling would silently sample a trained adapter.
+    spoofed = JaxBackendConfig(max_lora_adapters=2, max_lora_rank=32, external_inference=True)
+    TinkerEngine._validate_backend_config(local, spoofed)
+    assert spoofed.external_inference is False
+
+    # Non-JAX backends are left alone.
+    untouched = JaxBackendConfig(max_lora_adapters=1, max_lora_rank=32, external_inference=True)
+    TinkerEngine._validate_backend_config(EngineConfig(base_model=BASE_MODEL, backend="fsdp"), untouched)
+    assert untouched.external_inference is True
+
+
 def test_max_adapters_after_delete():
     """Test that deleting a model frees a slot for new models."""
     backend = create_backend()

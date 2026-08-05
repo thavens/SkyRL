@@ -13,6 +13,25 @@ from cloudpathlib import AnyPath
 from skyrl.utils.log import logger
 
 
+def _skip_for_rank(dest: AnyPath, rank: Optional[int]) -> bool:
+    """Whether this rank should skip writing ``dest``.
+
+    If a probe file exists at ``{dest}.probe`` the filesystem is shared, so only rank 0 writes.
+    """
+    if rank is not None and rank != 0 and dest.with_name(dest.name + ".probe").exists():
+        logger.info(f"Skipping write to {dest} (shared filesystem, rank {rank})")
+        return True
+    return False
+
+
+def _write_targz(fileobj, src_dir: Path | str) -> None:
+    """Write ``src_dir``'s contents to ``fileobj`` as a tar.gz archive."""
+    # Use compresslevel=0 to prioritize speed, as checkpoint files don't compress well.
+    with gzip.GzipFile(fileobj=fileobj, mode="wb", compresslevel=0) as gz_stream:
+        with tarfile.open(fileobj=gz_stream, mode="w:") as tar:
+            tar.add(str(src_dir), arcname="")
+
+
 @contextmanager
 def pack_and_upload(dest: AnyPath, rank: Optional[int] = None) -> Generator[Path, None, None]:
     """Give the caller a temp directory that gets uploaded as a tar.gz archive on exit.
@@ -27,18 +46,13 @@ def pack_and_upload(dest: AnyPath, rank: Optional[int] = None) -> Generator[Path
 
         yield tmp_path
 
-        # If probe file exists, filesystem is shared - only rank 0 should write
-        if rank is not None and rank != 0 and dest.with_name(dest.name + ".probe").exists():
-            logger.info(f"Skipping write to {dest} (shared filesystem, rank {rank})")
+        if _skip_for_rank(dest, rank):
             return
 
         dest.parent.mkdir(parents=True, exist_ok=True)
 
         with dest.open("wb") as f:
-            # Use compresslevel=0 to prioritize speed, as checkpoint files don't compress well.
-            with gzip.GzipFile(fileobj=f, mode="wb", compresslevel=0) as gz_stream:
-                with tarfile.open(fileobj=gz_stream, mode="w:") as tar:
-                    tar.add(tmp_path, arcname="")
+            _write_targz(f, tmp_path)
 
 
 @contextmanager
@@ -67,9 +81,7 @@ def write_and_publish_dir(dest: AnyPath, rank: Optional[int] = None) -> Generato
     try:
         yield tmp
 
-        # If probe file exists, filesystem is shared - only rank 0 should publish.
-        if rank is not None and rank != 0 and dest.with_name(dest.name + ".probe").exists():
-            logger.info(f"Skipping write to {dest} (shared filesystem, rank {rank})")
+        if _skip_for_rank(dest, rank):
             return
 
         # Idempotent re-save / retry with the same (deterministic) content: if dest
@@ -126,9 +138,7 @@ def read_as_archive(source: AnyPath) -> io.BytesIO:
     """
     if source.is_dir():
         buffer = io.BytesIO()
-        with gzip.GzipFile(fileobj=buffer, mode="wb", compresslevel=0) as gz_stream:
-            with tarfile.open(fileobj=gz_stream, mode="w:") as tar:
-                tar.add(str(source), arcname="")
+        _write_targz(buffer, source)
         buffer.seek(0)
         return buffer
     return download_file(source)

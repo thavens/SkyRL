@@ -38,10 +38,10 @@ def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None
             # Extract onto target_dir's filesystem so the rename below is atomic.
             with download_and_unpack(checkpoint_path, scratch_dir=target_dir.parent) as extracted_path:
                 extracted_path.rename(target_dir)
-        except (FileExistsError, OSError) as e:
+        except OSError as e:
             # This could happen if two processes try to download the file.
             # In that case the other process won the race and created target_dir.
-            if not target_dir.exists() or (isinstance(e, OSError) and e.errno not in (errno.EEXIST, errno.ENOTEMPTY)):
+            if not target_dir.exists() or e.errno not in (errno.EEXIST, errno.ENOTEMPTY):
                 raise
 
 
@@ -51,8 +51,7 @@ class ExternalInferenceClient:
     def __init__(self, engine_config: EngineConfig, db_engine):
         self.base_url = f"{engine_config.external_inference_url}/v1"
         self.api_key = engine_config.external_inference_api_key
-        self.checkpoints_base = engine_config.checkpoints_base
-        self.lora_base_dir = engine_config.external_inference_lora_base
+        self.config = engine_config
         self.db_engine = db_engine
 
     # Transient failures worth retrying. Other HTTP errors (4xx) are
@@ -141,15 +140,15 @@ class ExternalInferenceClient:
             model_name = base_model
         else:
             # LoRA sampling: reference the adapter by name for dynamic loading.
-            model_name = f"{model_id}_{checkpoint_id}"
-            target_dir = self.lora_base_dir / model_name
+            target_dir = self.config.sampler_adapter_dir(model_id, checkpoint_id)
+            model_name = target_dir.name
 
-            # The JAX backend + external inference writes the adapter directly to
-            # target_dir as a plain directory, so no extraction is needed. Fall
-            # back to extracting the tar.gz for any pre-existing/older sampler
-            # checkpoints (or backends that still write a tar).
+            # The adapter may already be published here as a plain directory (see
+            # EngineConfig.publishes_sampler_adapter_in_place), in which case no extraction is
+            # needed. Otherwise extract the tar.gz -- also the path for pre-existing sampler
+            # checkpoints written before in-place publishing.
             if not target_dir.exists():
-                checkpoint_path = self.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+                checkpoint_path = self.config.sampler_archive_path(model_id, checkpoint_id)
                 await asyncio.to_thread(_extract_checkpoint_sync, checkpoint_path, target_dir)
             load_response = await http_client.post(
                 "/load_lora_adapter",

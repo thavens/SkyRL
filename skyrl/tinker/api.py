@@ -1184,19 +1184,14 @@ async def validate_checkpoint(
         raise HTTPException(status_code=500, detail=f"Checkpoint creation failed: {checkpoint_db.error_message}")
 
     cfg = request.app.state.engine_config
-    # JAX backend + external inference publishes sampler adapters as a plain
-    # directory under external_inference_lora_base (see engine.process_save_weights_for_sampler),
-    # not a tar.gz under checkpoints_base. Return that path so archive endpoints
-    # resolve to the artifact that actually exists.
-    if (
-        checkpoint_type == types.CheckpointType.SAMPLER
-        and cfg.backend == "jax"
-        and cfg.external_inference_url is not None
-    ):
-        return cfg.external_inference_lora_base / f"{unique_id}_{checkpoint_id}"
+    # Resolve to the artifact that actually exists: sampler adapters may be published as a
+    # plain directory rather than a tar.gz (see EngineConfig.publishes_sampler_adapter_in_place).
+    if checkpoint_type == types.CheckpointType.SAMPLER:
+        if cfg.publishes_sampler_adapter_in_place:
+            return cfg.sampler_adapter_dir(unique_id, checkpoint_id)
+        return cfg.sampler_archive_path(unique_id, checkpoint_id)
 
-    subdir = "sampler_weights" if checkpoint_type == types.CheckpointType.SAMPLER else ""
-    return cfg.checkpoints_base / unique_id / subdir / f"{checkpoint_id}.tar.gz"
+    return cfg.checkpoints_base / unique_id / f"{checkpoint_id}.tar.gz"
 
 
 @app.get("/api/v1/training_runs")

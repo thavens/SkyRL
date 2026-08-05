@@ -80,7 +80,7 @@ def _server_is_up(port: int) -> bool:
     import urllib.request
 
     try:
-        urllib.request.urlopen(f"http://0.0.0.0:{port}/api/v1/healthz", timeout=2).read()
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/healthz", timeout=2).read()
         return True
     except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError):
         return False
@@ -99,7 +99,7 @@ def _api_server(port: int, db_path: str, backend_config: dict | None = None):
         cmd = [
             "uv", "run", "--extra", "tinker", "--extra", "megatron",
             "-m", "skyrl.tinker.api",
-            "--host", "0.0.0.0",
+            "--host", "127.0.0.1",
             "--port", str(port),
             "--base-model", BASE_MODEL,
             "--backend", "megatron",
@@ -151,7 +151,7 @@ def server_db_path():
 
 @pytest.fixture
 def service_client(server_db_path):
-    return tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_PORT}/", api_key=TINKER_API_KEY)
+    return tinker.ServiceClient(base_url=f"http://127.0.0.1:{TEST_PORT}/", api_key=TINKER_API_KEY)
 
 
 def _read_engine_state(db_path: str):
@@ -193,7 +193,7 @@ def _train_one_step(tc, tok):
 def test_engine_state_published(server_db_path):
     """After a save_weights_for_sampler the engine publishes its proxy URL."""
     proc, db_path, _ = server_db_path
-    sc = tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_PORT}/", api_key=TINKER_API_KEY)
+    sc = tinker.ServiceClient(base_url=f"http://127.0.0.1:{TEST_PORT}/", api_key=TINKER_API_KEY)
     tc = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)
     tok = AutoTokenizer.from_pretrained(BASE_MODEL)
 
@@ -221,7 +221,7 @@ def test_sample_uses_external_path(server_db_path):
     from skyrl.tinker.db_models import FutureDB
 
     proc, db_path, _ = server_db_path
-    sc = tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_PORT}/", api_key=TINKER_API_KEY)
+    sc = tinker.ServiceClient(base_url=f"http://127.0.0.1:{TEST_PORT}/", api_key=TINKER_API_KEY)
     tc = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)
     tok = AutoTokenizer.from_pretrained(BASE_MODEL)
 
@@ -274,7 +274,7 @@ def test_sample_concurrent_with_training_is_fast(server_db_path):
     training stream's wall-clock duration.
     """
     proc, _, _ = server_db_path
-    sc = tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_PORT}/", api_key=TINKER_API_KEY)
+    sc = tinker.ServiceClient(base_url=f"http://127.0.0.1:{TEST_PORT}/", api_key=TINKER_API_KEY)
     tc = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)
     tok = AutoTokenizer.from_pretrained(BASE_MODEL)
 
@@ -365,7 +365,7 @@ def test_concurrent_samples_per_adapter(server_db_path):
     same name during save_weights_for_sampler).
     """
     proc, _, _ = server_db_path
-    sc = tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_PORT}/", api_key=TINKER_API_KEY)
+    sc = tinker.ServiceClient(base_url=f"http://127.0.0.1:{TEST_PORT}/", api_key=TINKER_API_KEY)
     tok = AutoTokenizer.from_pretrained(BASE_MODEL)
 
     tc_a = sc.create_lora_training_client(base_model=BASE_MODEL, rank=8)

@@ -28,7 +28,6 @@ Run with:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import subprocess
@@ -50,7 +49,7 @@ pytestmark = pytest.mark.skipif(not cuda_available, reason="multi-LoRA Megatron 
 tinker = pytest.importorskip("tinker")
 from tinker import types as tinker_types  # noqa: E402
 
-from tests.tinker.conftest import wait_for_condition  # noqa: E402
+from tests.tinker.conftest import unload_model, wait_for_condition  # noqa: E402
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
 TINKER_API_KEY = "tml-dummy"
@@ -90,7 +89,7 @@ def _api_server(port: int, backend_config: dict | None = None):
             "-m",
             "skyrl.tinker.api",
             "--host",
-            "0.0.0.0",
+            "127.0.0.1",
             "--port",
             str(port),
             "--base-model",
@@ -129,7 +128,7 @@ def _server_is_up(port: int) -> bool:
     import urllib.request
 
     try:
-        urllib.request.urlopen(f"http://0.0.0.0:{port}/api/v1/healthz", timeout=2).read()
+        urllib.request.urlopen(f"http://127.0.0.1:{port}/api/v1/healthz", timeout=2).read()
         return True
     except (urllib.error.URLError, urllib.error.HTTPError, ConnectionError, TimeoutError):
         return False
@@ -155,7 +154,7 @@ def server():
 
 @pytest.fixture
 def service_client(server):
-    return tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_PORT}/", api_key=TINKER_API_KEY)
+    return tinker.ServiceClient(base_url=f"http://127.0.0.1:{TEST_PORT}/", api_key=TINKER_API_KEY)
 
 
 def _sample_greedy(tc, name, tok, prompt: str, max_tokens: int = 8) -> list[int]:
@@ -277,20 +276,7 @@ def test_delete_then_train_remaining(service_client):
 
     # Delete A via the unload_model endpoint (Tinker exposes this as the
     # public deletion path).
-    async def _unload(model_id: str):
-        async with tinker._client.AsyncTinker(  # type: ignore[attr-defined]
-            api_key=TINKER_API_KEY, base_url=f"http://0.0.0.0:{TEST_PORT}/"
-        ) as client:
-            future = await client.models.unload(request=tinker_types.UnloadModelRequest(model_id=model_id))
-            while True:
-                result = await client.futures.retrieve(
-                    request=tinker_types.FutureRetrieveRequest(request_id=future.request_id)
-                )
-                if isinstance(result, tinker_types.UnloadModelResponse):
-                    return result
-                await asyncio.sleep(0.1)
-
-    asyncio.run(_unload(a.model_id))
+    unload_model(f"http://127.0.0.1:{TEST_PORT}/", a.model_id, api_key=TINKER_API_KEY)
 
     # B should still train successfully — backend should NOT have done a
     # ray.shutdown when only A was deleted.

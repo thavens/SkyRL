@@ -68,7 +68,25 @@ _DEFAULT_PPO_CLIP_HIGH_THRESHOLD = 1.2
 class JaxBackendConfig(BaseModel, extra="forbid"):
     """Configuration specific to the JAX backend."""
 
-    max_lora_adapters: int = Field(default=32, description="Maximum number of LoRA adapters")
+    max_lora_adapters: int = Field(
+        default=32,
+        description=(
+            "Number of LoRA adapter slots. When sampling is routed to an external inference "
+            "server, all N slots serve user models. Otherwise slot 0 is reserved as a zeroed "
+            "'no LoRA' adapter for base-model sampling and batch padding, so N slots serve only "
+            "N-1 concurrent models; max_lora_adapters=1 then leaves no usable slot at all and "
+            "the engine refuses to start."
+        ),
+    )
+    external_inference: bool = Field(
+        default=False,
+        description=(
+            "Derived by the engine from --external-inference-url; do not set it in "
+            "--backend-config, the engine overwrites whatever is passed. True means sampling "
+            "never reaches this backend, so the reserved base-model slot 0 is handed to user "
+            "models instead of sitting idle."
+        ),
+    )
     max_lora_rank: int = Field(default=32, description="Maximum LoRA rank")
     tensor_parallel_size: int = Field(default=1, description="Tensor parallelism degree to use for the model")
     expert_parallel_size: int = Field(default=1, description="Expert parallelism degree for MoE layers")
@@ -327,7 +345,10 @@ class JaxBackendImpl(AbstractBackend):
             # Split model into LoRA and non-LoRA parameters
             self.graphdef, self.lora_params, self.non_lora_params = nnx.split(self.model, self.model.is_lora_param, ...)
 
-            # Initialize adapter 0 with minimal config (required for base model sampling path)
+            # Initialize adapter 0 with minimal config (required for base model sampling path).
+            # lora_B is zeroed, so the slot contributes nothing and behaves as the bare base model.
+            # Under external inference this slot belongs to a user model instead; the zeroed
+            # init still holds until create_model overwrites it.
             init_lora_adapter(self.model, adapter_index=0, lora_config=types.LoraConfig(rank=1, alpha=1.0, seed=0))
 
             # Initialize global accumulated gradients and shared slot-masked optimizer state
@@ -339,7 +360,9 @@ class JaxBackendImpl(AbstractBackend):
 
         logger.info(
             f"Initialized base model {base_model} with "
-            f"max_lora_adapters={config.max_lora_adapters}, max_lora_rank={config.max_lora_rank}"
+            f"max_lora_adapters={config.max_lora_adapters}, max_lora_rank={config.max_lora_rank}, "
+            f"usable adapter slots={config.max_lora_adapters - self.first_adapter_index} "
+            f"(base-model slot {'released' if self.first_adapter_index == 0 else 'reserved'})"
         )
 
         if config.train_micro_batch_size <= 0:
@@ -543,6 +566,10 @@ class JaxBackendImpl(AbstractBackend):
             new_accumulated_grads = accumulated_grads.add(lora_grads, adapter_indices)
             return new_accumulated_grads, per_token_losses, target_logprobs
 
+        def shardings_of(tree):
+            """NamedShardings mirroring a pytree's own partition spec."""
+            return jax.tree.map(lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(tree))
+
         if self.config.enforce_eager:
             # Disable JIT compilation for debugging
             self._forward_backward_and_accumulate = forward_backward_and_accumulate
@@ -550,16 +577,10 @@ class JaxBackendImpl(AbstractBackend):
 
         else:
             # Retrieve the sharding of lora and non_lora params and compute the sharding of inputs and outputs
-            lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.lora_params)
-            )
-            non_lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.non_lora_params)
-            )
+            lora_shardings = shardings_of(self.lora_params)
+            non_lora_shardings = shardings_of(self.non_lora_params)
             # Get sharding for AccumulatedGradients
-            accumulated_grads_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
-            )
+            accumulated_grads_shardings = shardings_of(self.accumulated_grads)
 
             # Shard batch inputs along the FSDP axis (batch, seq_len)
             batch_sharded_2d = jax.NamedSharding(self.mesh, jax.P("fsdp", None))
@@ -665,15 +686,9 @@ class JaxBackendImpl(AbstractBackend):
         if self.config.enforce_eager:
             self._compute_grads_and_update = compute_grads_and_update
         else:
-            optim_lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.lora_params)
-            )
-            optim_accum_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
-            )
-            adam_state_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.adam_state)
-            )
+            optim_lora_shardings = shardings_of(self.lora_params)
+            optim_accum_shardings = shardings_of(self.accumulated_grads)
+            adam_state_shardings = shardings_of(self.adam_state)
             self._compute_grads_and_update = jax.jit(
                 compute_grads_and_update,
                 in_shardings=(optim_accum_shardings, optim_lora_shardings, adam_state_shardings, None, None),
@@ -685,6 +700,22 @@ class JaxBackendImpl(AbstractBackend):
         """Check if a model is registered with the backend."""
         return model_id in self.models
 
+    @property
+    def first_adapter_index(self) -> int:
+        """Lowest adapter slot available to user models.
+
+        Slot 0 doubles as the zeroed "no LoRA" adapter: base-model sampling routes to it
+        (see load_sampler_weights) and batch padding zero-fills into it. Reserving it is not
+        free -- every slot costs the stacked LoRA weights plus fp32 grad_sum/mu/nu -- and it
+        only earns its keep when sampling can actually reach this backend.
+
+        With external inference the sampling path here is never exercised, so slot 0 would sit
+        idle; it goes to user models instead and all N slots are usable. Otherwise slot 0 stays
+        reserved and N slots serve N-1 models, which leaves max_lora_adapters=1 with no usable
+        slot at all -- TinkerEngine.__init__ refuses to start in that combination.
+        """
+        return 0 if self.config.external_inference else 1
+
     def create_model(self, model_id: str, lora_config: types.LoraConfig, model_role: str = "policy") -> None:
         """Create a new model in the backend.
 
@@ -692,14 +723,16 @@ class JaxBackendImpl(AbstractBackend):
         """
         if model_role != "policy":
             raise ValueError(f"JaxBackend only supports model_role='policy', got {model_role!r}")
-        # Allocate adapter index for this model_id (find first available slot)
-        # Index 0 is reserved for base model, so user models use indices 1 to max_lora_adapters-1
+        # Allocate adapter index for this model_id (find first available slot).
+        # Index 0 is reserved for the base model unless sampling is external; see
+        # first_adapter_index.
+        first_index = self.first_adapter_index
         used_indices = {m.adapter_index for m in self.models.values()}
-        available_indices = set(range(1, self.config.max_lora_adapters)) - used_indices
+        available_indices = set(range(first_index, self.config.max_lora_adapters)) - used_indices
         if not available_indices:
             raise ValueError(f"Maximum number of LoRA adapters ({self.config.max_lora_adapters}) reached")
         adapter_index = min(available_indices)
-        assert 1 <= adapter_index <= self.config.max_lora_adapters - 1
+        assert first_index <= adapter_index <= self.config.max_lora_adapters - 1
 
         # Validate rank doesn't exceed max
         if not (0 < lora_config.rank <= self.config.max_lora_rank):
@@ -711,10 +744,9 @@ class JaxBackendImpl(AbstractBackend):
             lora_config=lora_config,
         )
 
-        # Reset the shared optimizer slot for this adapter (the slot may have been
-        # used by a previously deleted model) and configure the adapter weights.
+        # The shared optimizer slot is already zeroed: AdamState.create zeroes every slot, and
+        # delete_model zeroes the slot it releases -- the only way one becomes available again.
         with jax.set_mesh(self.mesh):
-            self.adam_state = self.adam_state.reset_adapter(jnp.int32(adapter_index))
             init_lora_adapter(self.model, adapter_index, lora_config)
         logger.info(f"Created model {model_id} with adapter_index={adapter_index}, config={lora_config}")
 
@@ -957,14 +989,12 @@ class JaxBackendImpl(AbstractBackend):
 
         # JIT-compiled: compute full gradients, apply slot-masked AdamW update, and reset accumulated grads
         with jax.set_mesh(self.mesh):
-            self.accumulated_grads, new_lora_params, self.adam_state, optim_metrics = (
-                self._compute_grads_and_update(
-                    self.accumulated_grads,
-                    self.lora_params,
-                    self.adam_state,
-                    hyperparams,
-                    jnp.int32(adapter_index),
-                )
+            self.accumulated_grads, new_lora_params, self.adam_state, optim_metrics = self._compute_grads_and_update(
+                self.accumulated_grads,
+                self.lora_params,
+                self.adam_state,
+                hyperparams,
+                jnp.int32(adapter_index),
             )
             # Write the updated params back into the shared model Variables so
             # self.model and self.lora_params stay coherent views.

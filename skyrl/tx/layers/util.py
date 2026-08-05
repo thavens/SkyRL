@@ -23,10 +23,16 @@ def _ragged_contract(a: jax.Array, b: jax.Array, group_sizes: jax.Array) -> jax.
     q = b.shape[1]
     bounds = jnp.cumulative_sum(group_sizes, include_initial=True)
     tok = jnp.arange(m)
+    # Zeroing either operand's out-of-group rows gives the same product, so mask the narrower
+    # one: for the lora_A gradient ``a`` is [m, in_features] while ``b`` is [m, rank], making
+    # the masked temporary orders of magnitude smaller.
+    mask_a = p <= q
 
     def body(g, acc):
-        mask = ((tok >= bounds[g]) & (tok < bounds[g + 1])).astype(a.dtype)
-        return acc.at[g].set((a * mask[:, None]).T @ b)
+        in_group = (tok >= bounds[g]) & (tok < bounds[g + 1])
+        if mask_a:
+            return acc.at[g].set((a * in_group[:, None].astype(a.dtype)).T @ b)
+        return acc.at[g].set(a.T @ (b * in_group[:, None].astype(b.dtype)))
 
     return lax.fori_loop(0, num_groups, body, jnp.zeros((num_groups, p, q), a.dtype))
 
