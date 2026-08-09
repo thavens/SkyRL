@@ -404,12 +404,10 @@ def extract_adapter_state(adapter_index: int, lora_params: nnx.GraphState, rank:
     return jax.tree.map_with_path(extract_state, lora_params)
 
 
-# We need to use nnx.jit here instead of jax.jit so the nnx.update will be handled correctly
-@nnx.jit(static_argnames=("adapter_index", "rank"))
-def insert_adapter_state(
+def compute_updated_adapter_state(
     adapter_index: int, lora_params: nnx.GraphState, new_params: nnx.GraphState, rank: int
-) -> None:
-    "Helper function to insert the adapter parameters for a specific adapter index (inverse of extract_adapter_state)."
+) -> nnx.GraphState:
+    "Pure version of insert_adapter_state: returns the updated tree instead of mutating in place."
 
     def insert_state(path: tuple, p: jax.Array, new: jax.Array):
         key = path[-2].key
@@ -425,8 +423,16 @@ def insert_adapter_state(
             return p.at[*idx, ..., :rank].set(new)
         return p.at[*idx, ..., :rank, :].set(new)
 
-    updated = jax.tree.map_with_path(insert_state, lora_params, new_params)
-    nnx.update(lora_params, updated)
+    return jax.tree.map_with_path(insert_state, lora_params, new_params)
+
+
+# We need to use nnx.jit here instead of jax.jit so the nnx.update will be handled correctly
+@nnx.jit(static_argnames=("adapter_index", "rank"))
+def insert_adapter_state(
+    adapter_index: int, lora_params: nnx.GraphState, new_params: nnx.GraphState, rank: int
+) -> None:
+    "Helper function to insert the adapter parameters for a specific adapter index (inverse of extract_adapter_state)."
+    nnx.update(lora_params, compute_updated_adapter_state(adapter_index, lora_params, new_params, rank))
 
 
 def round_up_seq_len(seq_len: int) -> int:
