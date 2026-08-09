@@ -13,7 +13,7 @@ from uuid import uuid4
 
 import fastapi
 import psutil
-from fastapi import Depends, FastAPI, HTTPException, Request
+from fastapi import Depends, FastAPI, HTTPException, Request, Response
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import (
     Base64Bytes,
@@ -29,7 +29,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlmodel import SQLModel, func, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from skyrl.tinker import types
+from skyrl.tinker import proto_conv, types
 from skyrl.tinker.config import EngineConfig, add_model, config_to_argv
 from skyrl.tinker.db_models import (
     CheckpointDB,
@@ -920,14 +920,43 @@ async def get_training_run(model_id: str, session: AsyncSession = Depends(get_se
     )
 
 
+async def _parse_forward_backward_body(req: Request) -> tuple[ForwardBackwardRequest, bool]:
+    """Decode a forward_backward request from either wire format.
+
+    SDK >=0.25 posts protobuf (Content-Type application/x-protobuf) with the
+    forward/forward_backward distinction carried in-band as ``forward_only``;
+    older SDKs post JSON to this endpoint (always fwd+bwd) and hit
+    /api/v1/forward for forward-only. Decoding errors surface as 400s rather
+    than pydantic 422s -- FastAPI's validation-error encoder chokes on the
+    raw proto bytes it would embed in the 422 detail.
+    """
+    content_type = req.headers.get("content-type", "")
+    if "application/x-protobuf" not in content_type:
+        return ForwardBackwardRequest.model_validate(await req.json()), False
+    body = await req.body()
+    if req.headers.get("content-encoding") == "zstd":
+        # Only sent when the server's client-config opts in, which we never do;
+        # reject loudly rather than feed compressed bytes to the proto parser.
+        raise HTTPException(status_code=415, detail="zstd-compressed request bodies are not supported")
+    try:
+        decoded = proto_conv.deserialize_forward_backward_request(body)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid protobuf forward_backward request: {e}")
+    if decoded is None:
+        raise HTTPException(status_code=415, detail="Server cannot decode protobuf requests (no SDK proto module)")
+    request_dict, forward_only = decoded
+    return ForwardBackwardRequest.model_validate(request_dict), forward_only
+
+
 @app.post("/api/v1/forward_backward", response_model=FutureResponse)
-async def forward_backward(request: ForwardBackwardRequest, session: AsyncSession = Depends(get_session)):
-    """Compute and accumulate gradients."""
+async def forward_backward(req: Request, session: AsyncSession = Depends(get_session)):
+    """Compute and accumulate gradients (or forward-only when the proto body says so)."""
+    request, forward_only = await _parse_forward_backward_body(req)
     await get_model(session, request.model_id)
 
     request_id = await create_future(
         session=session,
-        request_type=types.RequestType.FORWARD_BACKWARD,
+        request_type=types.RequestType.FORWARD if forward_only else types.RequestType.FORWARD_BACKWARD,
         model_id=request.model_id,
         request_data=request.forward_backward_input.to_types(),
     )
@@ -1185,6 +1214,24 @@ async def retrieve_future(request: RetrieveFutureRequest, req: Request):
                     future = result.first()
 
                     if future.status == RequestStatus.COMPLETED:
+                        # SDK >=0.24 decodes sample and forward/backward results
+                        # from proto only; older clients omit the Accept header
+                        # and still get JSON.
+                        if "application/x-protobuf" in req.headers.get("accept", ""):
+                            # Encoding a forward/backward batch is multi-MB of numpy
+                            # and protobuf work, so keep it off the event loop.
+                            try:
+                                proto_bytes = await asyncio.to_thread(
+                                    proto_conv.serialize, future.request_type, future.result_data
+                                )
+                            except Exception:
+                                # The result itself is fine -- only this encoding of it failed
+                                # (an unsupported dtype or stop_reason). Serve the JSON body
+                                # rather than turning a completed request into a permanent 500.
+                                logger.exception(f"Proto encoding failed for request {request.request_id}; using JSON")
+                                proto_bytes = None
+                            if proto_bytes is not None:
+                                return Response(content=proto_bytes, media_type="application/x-protobuf")
                         return future.result_data
 
                     if future.status == RequestStatus.FAILED:
