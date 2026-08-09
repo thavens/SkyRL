@@ -121,3 +121,47 @@ class TestFlashAttention:
         seq_lengths = [100, 80]
         mask = make_right_padded_mask(batch, seq_len, seq_lengths)
         assert_attention_match(q, k, v, mask, is_causal=True, head_dim=head_dim, seq_lengths=seq_lengths)
+
+
+class TestPallasFlashAttention:
+    """Pallas path (head_dim=256, > cuDNN's 128 cap) matches XLA, fwd and bwd."""
+
+    @pytest.mark.parametrize("seq_len", [64, 128, 256, 200, 513])
+    def test_gqa_prefill_head_dim_256(self, seq_len):
+        """Large-head-dim GQA causal prefill, including non-block-multiple lengths."""
+        batch, num_heads, num_kv_heads, head_dim = 2, 8, 2, 256
+        q, k, v = make_qkv(batch, seq_len, num_heads, head_dim, num_kv_heads)
+        seq_lengths = [seq_len, max(1, seq_len - 17)]
+        mask = make_right_padded_mask(batch, seq_len, seq_lengths)
+        assert_attention_match(q, k, v, mask, is_causal=True, head_dim=head_dim, seq_lengths=seq_lengths)
+
+    def test_mha_prefill_head_dim_256(self):
+        """Large-head-dim MHA (no GQA expansion) causal prefill."""
+        batch, seq_len, num_heads, head_dim = 2, 128, 8, 256
+        q, k, v = make_qkv(batch, seq_len, num_heads, head_dim)
+        seq_lengths = [128, 100]
+        mask = make_right_padded_mask(batch, seq_len, seq_lengths)
+        assert_attention_match(q, k, v, mask, is_causal=True, head_dim=head_dim, seq_lengths=seq_lengths)
+
+    @pytest.mark.parametrize("seq_len", [128, 256])
+    def test_gqa_backward_head_dim_256(self, seq_len):
+        """Gradients through the Pallas path match XLA (exercises the backward kernel)."""
+        batch, num_heads, num_kv_heads, head_dim = 2, 8, 2, 256
+        q, k, v = make_qkv(batch, seq_len, num_heads, head_dim, num_kv_heads)
+        mask = jnp.ones((batch, seq_len))
+
+        def loss(fn):
+            def _loss(q, k, v):
+                return fn(q, k, v, mask, is_causal=True, head_dim=head_dim).astype(jnp.float32).sum()
+
+            return _loss
+
+        ref = lambda q, k, v, m, is_causal, head_dim: jax.nn.dot_product_attention(  # noqa: E731
+            q, k, v, scale=1.0 / head_dim**0.5, mask=m[:, None, None, :].astype(bool), is_causal=is_causal
+        )
+        g_pallas = jax.grad(loss(dot_product_attention), argnums=(0, 1, 2))(q, k, v)
+        g_ref = jax.grad(loss(ref), argnums=(0, 1, 2))(q, k, v)
+        for name, gp, gr in zip("qkv", g_pallas, g_ref):
+            denom = jnp.max(jnp.abs(gr.astype(jnp.float32))) + 1e-6
+            rel = jnp.max(jnp.abs(gp.astype(jnp.float32) - gr.astype(jnp.float32))) / denom
+            assert rel < 0.05, f"grad_{name} rel error {rel} too high"
