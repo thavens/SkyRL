@@ -546,6 +546,10 @@ class JaxBackendImpl(AbstractBackend):
             new_accumulated_grads = accumulated_grads.add(lora_grads, adapter_indices)
             return new_accumulated_grads, per_token_losses, target_logprobs
 
+        def shardings_of(tree):
+            """NamedShardings mirroring a pytree's own partition spec."""
+            return jax.tree.map(lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(tree))
+
         if self.config.enforce_eager:
             # Disable JIT compilation for debugging
             self._forward_backward_and_accumulate = forward_backward_and_accumulate
@@ -553,16 +557,10 @@ class JaxBackendImpl(AbstractBackend):
 
         else:
             # Retrieve the sharding of lora and non_lora params and compute the sharding of inputs and outputs
-            lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.lora_params)
-            )
-            non_lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.non_lora_params)
-            )
+            lora_shardings = shardings_of(self.lora_params)
+            non_lora_shardings = shardings_of(self.non_lora_params)
             # Get sharding for AccumulatedGradients
-            accumulated_grads_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
-            )
+            accumulated_grads_shardings = shardings_of(self.accumulated_grads)
 
             # Shard batch inputs along the FSDP axis (batch, seq_len)
             batch_sharded_2d = jax.NamedSharding(self.mesh, jax.P("fsdp", None))
@@ -668,20 +666,16 @@ class JaxBackendImpl(AbstractBackend):
         if self.config.enforce_eager:
             self._compute_grads_and_update = compute_grads_and_update
         else:
-            optim_lora_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.lora_params)
-            )
-            optim_accum_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.accumulated_grads)
-            )
-            adam_state_shardings = jax.tree.map(
-                lambda spec: jax.NamedSharding(self.mesh, spec), nnx.get_partition_spec(self.adam_state)
-            )
+            adam_state_shardings = shardings_of(self.adam_state)
             self._compute_grads_and_update = jax.jit(
                 compute_grads_and_update,
-                in_shardings=(optim_accum_shardings, optim_lora_shardings, adam_state_shardings, None, None),
-                out_shardings=(optim_accum_shardings, optim_lora_shardings, adam_state_shardings, None),
-                donate_argnames=("accumulated_grads", "adam_state"),
+                in_shardings=(accumulated_grads_shardings, lora_shardings, adam_state_shardings, None, None),
+                out_shardings=(accumulated_grads_shardings, lora_shardings, adam_state_shardings, None),
+                # lora_params is donated too: optim_step writes the result straight back into
+                # the same Variables (nnx.update below the call), so the input buffers are dead
+                # on return and XLA can update the slot in place instead of copying the whole
+                # max_lora_adapters-stacked tree.
+                donate_argnames=("accumulated_grads", "lora_params", "adam_state"),
             )
 
     def has_model(self, model_id: str) -> bool:
@@ -719,7 +713,6 @@ class JaxBackendImpl(AbstractBackend):
         # slot, and delete_model zeroes the slot it releases -- the only way one becomes
         # available again.
         with jax.set_mesh(self.mesh):
-            self.adam_state = self.adam_state.reset_adapter(jnp.int32(adapter_index))
             init_lora_adapter(self.model, adapter_index, lora_config)
         logger.info(f"Created model {model_id} with adapter_index={adapter_index}, config={lora_config}")
 
