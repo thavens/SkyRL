@@ -1,5 +1,6 @@
 import asyncio
 import errno
+import itertools
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -58,6 +59,49 @@ class ExternalInferenceClient:
         self.api_key = engine_config.external_inference_api_key
         self.config = engine_config
         self.db_engine = db_engine
+        # RL refreshes the sampler adapter every optimizer step, each under a new
+        # checkpoint_id, and vLLM's filesystem resolver loads them on demand but never
+        # unloads -- so adapters pile up (one per step) until the engine wedges (GPU
+        # pinned, no completions). Track the live adapter per model and unload the prior
+        # one when it rolls over, so vLLM only ever holds the current adapter.
+        self._live_lora: dict[str, tuple[int, str]] = {}
+        self._lora_seq = itertools.count()
+        self._lora_lock = asyncio.Lock()
+
+    async def _retire_previous_adapter(
+        self, model_id: str, model_name: str, seq: int, http_client: httpx.AsyncClient
+    ) -> None:
+        """Unload the model's previous adapter now that ``model_name`` has served a request.
+
+        ``seq`` is the order this request *started* in, not the order it finished. Samples
+        for consecutive checkpoints overlap, so ranking by completion lets a straggler from
+        the older checkpoint declare itself live and unload the newer adapter that requests
+        are still arriving for -- while the genuinely stale one leaks, which is the opposite
+        of the point. Start order is the closest signal available here: checkpoint ids are
+        caller-supplied strings with no guaranteed ordering, and a sample cannot start
+        before its adapter was published.
+
+        Best-effort: a failed unload just reverts to the old accumulate-and-wedge
+        behaviour, it never breaks sampling. The lock serialises only the bookkeeping,
+        so exactly one sample per rollover issues the unload; the rest do not wait on it.
+        """
+        async with self._lora_lock:
+            live = self._live_lora.get(model_id)
+            if live is not None and (live[1] == model_name or live[0] > seq):
+                # Already the live adapter, or an older request finishing late -- either way
+                # there is nothing this call should unload.
+                return
+            self._live_lora[model_id] = (seq, model_name)
+        if live is None:
+            return
+        previous = live[1]
+        try:
+            response = await http_client.post("/unload_lora_adapter", json={"lora_name": previous})
+            response.raise_for_status()
+        except httpx.HTTPError:
+            # Non-fatal: worst case the old adapter lingers, which is just the prior
+            # (working-but-leaky) behaviour.
+            logger.warning(f"Failed to unload stale LoRA adapter {previous}; it will linger on the engine")
 
     async def call_and_store_result(
         self,
@@ -111,6 +155,10 @@ class ExternalInferenceClient:
         model_input = request.prompt.to_types()
         prompt_tokens = render_model_input([model_input])[0].prompt_ids
 
+        # Stamped before the call so adapter retirement can rank requests by start order
+        # rather than completion order; see _retire_previous_adapter.
+        lora_seq = next(self._lora_seq)
+
         if base_model:
             # Base model sampling: use the model name directly, no LoRA checkpoint needed
             model_name = base_model
@@ -156,6 +204,12 @@ class ExternalInferenceClient:
         response = await http_client.post("/completions", json=payload, headers=headers)
         response.raise_for_status()
         result = response.json()
+
+        # The request succeeded, so this adapter is definitely resident; retire the one it
+        # replaced. Done after the call rather than before so a failed sample never unloads
+        # a working adapter.
+        if not base_model:
+            await self._retire_previous_adapter(model_id, model_name, lora_seq, http_client)
 
         prompt_logprobs = None
         topk = None
