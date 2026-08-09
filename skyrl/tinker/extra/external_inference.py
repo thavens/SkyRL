@@ -1,4 +1,5 @@
 import asyncio
+import errno
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -22,6 +23,15 @@ if TYPE_CHECKING:
 def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None:
     """Extract a LoRA checkpoint to disk for vLLM to load.
 
+    The checkpoint is extracted onto ``target_dir``'s own filesystem (via
+    ``scratch_dir``), so publishing it is a single atomic ``rename``. This is
+    what prevents the load-time 404: a concurrent request racing to load the
+    same freshly-trained checkpoint either sees no ``target_dir`` or sees the
+    complete one, never a half-written directory. Extracting into the system
+    temp dir instead makes the rename a cross-device move, which either raises
+    EXDEV or degrades to a non-atomic copy that briefly exposes a partial
+    directory.
+
     This is a blocking operation (filesystem/network I/O) and should be called
     via asyncio.to_thread() to avoid blocking the event loop.
     """
@@ -30,12 +40,14 @@ def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None
     # Extract the checkpoint if it doesn't already exist
     if not target_dir.exists():
         try:
-            with download_and_unpack(checkpoint_path) as extracted_path:
+            # Extract onto target_dir's filesystem so the rename below is atomic.
+            with download_and_unpack(checkpoint_path, scratch_dir=target_dir.parent) as extracted_path:
                 extracted_path.rename(target_dir)
-        except FileExistsError:
+        except OSError as e:
             # This could happen if two processes try to download the file.
             # In that case the other process won the race and created target_dir.
-            pass
+            if not target_dir.exists() or e.errno not in (errno.EEXIST, errno.ENOTEMPTY):
+                raise
 
 
 class ExternalInferenceClient:

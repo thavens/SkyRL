@@ -40,13 +40,17 @@ def pack_and_upload(dest: AnyPath, rank: Optional[int] = None) -> Generator[Path
 
 
 @contextmanager
-def download_and_unpack(source: AnyPath) -> Generator[Path, None, None]:
+def download_and_unpack(source: AnyPath, scratch_dir: Optional[Path] = None) -> Generator[Path, None, None]:
     """Download and extract a tar.gz archive and give the content to the caller in a temp directory.
 
     Args:
         source: Source path for the tar.gz file
+        scratch_dir: Directory under which to extract. Pass a path on the
+              destination's filesystem when the caller publishes the result via
+              an atomic rename (otherwise a cross-device move silently degrades
+              to a non-atomic copy); defaults to the system temp dir.
     """
-    with TemporaryDirectory() as tmp:
+    with TemporaryDirectory(dir=str(scratch_dir) if scratch_dir is not None else None) as tmp:
         tmp_path = Path(tmp)
 
         # Download and extract tar archive (handles both local and cloud storage)
