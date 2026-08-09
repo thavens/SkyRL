@@ -372,6 +372,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.value_dim = self.head_v_dim * self.num_v_heads
         self.conv_kernel_size = config.linear_conv_kernel_dim
         self.conv_dim = self.key_dim * 2 + self.value_dim
+        self.chunk_size = config.linear_attention_chunk_size
 
         # Keep linear-attention projections replicated across TP for simplicity/stability.
         self.in_proj_qkv = LoRALinear(
@@ -539,7 +540,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         # Use chunked version for prefill (better parallelization), recurrent for decode
         if seq_len > 1:
             core_out, new_recurrent_state = chunk_gated_delta_rule(
-                query, key, value, g, beta, chunk_size=64, initial_state=recurrent_state
+                query, key, value, g, beta, chunk_size=self.chunk_size, initial_state=recurrent_state
             )
         else:
             core_out, new_recurrent_state = recurrent_gated_delta_rule(query, key, value, g, beta, recurrent_state)
@@ -652,6 +653,35 @@ class Qwen3_5DecoderLayer(nnx.Module):
         return hidden_states, updated_kv, new_conv_state, new_recurrent_state
 
 
+def _remat_decoder_layer(
+    graphdef: nnx.GraphDef,
+    state,
+    hidden_states: jax.Array,
+    attention_mask: jax.Array | None,
+    positions: jax.Array,
+    adapter_indices: jax.Array | None,
+) -> jax.Array:
+    """Gradient-checkpointed decoder layer forward for the training path.
+
+    Operates on (graphdef, state) and re-merges the module internally rather than
+    receiving a live nnx Module, so it can be wrapped with jax.checkpoint without
+    crossing nnx trace levels (see skyrl/tx/layers/stacked.py for the same pattern).
+    No kv-cache is used during training, so the cache outputs are dropped and only
+    the hidden states are retained across the checkpoint boundary.
+    """
+    layer = nnx.merge(graphdef, state)
+    hidden_states, _, _, _ = layer(
+        hidden_states,
+        attention_mask=attention_mask,
+        positions=positions,
+        adapter_indices=adapter_indices,
+    )
+    return hidden_states
+
+
+_remat_decoder_layer = jax.checkpoint(_remat_decoder_layer, static_argnums=(0,))
+
+
 class Qwen3_5TextModel(nnx.Module):
 
     def __init__(self, config: Qwen3_5Config, *, dtype: jnp.dtype, rngs: nnx.Rngs) -> None:
@@ -708,53 +738,73 @@ class Qwen3_5TextModel(nnx.Module):
         batch_size = input_ids.shape[0]
         dtype = hidden_states.dtype
 
+        # Gradient checkpointing: recompute each decoder layer's activations during
+        # the backward pass instead of retaining all layers' activations at once.
+        # Only applies while training (no backward pass during cached decode).
+        remat_layers = self.config.gradient_checkpointing and is_training
+
         for layer_idx, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
-            has_cache = kv_cache is not None
-            has_conv_cache = has_cache and kv_cache.conv_states is not None and kv_cache.recurrent_states is not None
+            # Tag every layer's ops with a unique scope so the XLA buffer-assignment /
+            # memory-usage dumps (see runbook.md §4b) attribute the largest buffer to a
+            # specific layer index + type instead of collapsing onto the shared call site.
+            with jax.named_scope(f"layer_{layer_idx}_{self.layer_types[layer_idx]}"):
+                if remat_layers:
+                    graphdef, state = nnx.split(layer)
+                    hidden_states = _remat_decoder_layer(
+                        graphdef, state, hidden_states, attention_mask, positions, adapter_indices
+                    )
+                    continue
 
-            if self.layer_types[layer_idx] == "full_attention":
-                layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx]) if has_cache else None
-                hidden_states, updated_kv, _, _ = layer(
-                    hidden_states,
-                    attention_mask=attention_mask,
-                    positions=positions,
-                    adapter_indices=adapter_indices,
-                    kv_cache=layer_kv,
+                has_cache = kv_cache is not None
+                has_conv_cache = (
+                    has_cache and kv_cache.conv_states is not None and kv_cache.recurrent_states is not None
                 )
-                assert updated_kv is not None
-                updated_keys.append(updated_kv[0])
-                updated_values.append(updated_kv[1])
-                updated_conv_states.append(
-                    kv_cache.conv_states[layer_idx] if has_conv_cache else jnp.zeros((batch_size, 0, 0), dtype=dtype)
-                )
-                updated_recurrent_states.append(
-                    kv_cache.recurrent_states[layer_idx]
-                    if has_conv_cache
-                    else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
-                )
-            else:
-                conv_state = kv_cache.conv_states[layer_idx] if has_conv_cache else None
-                recurrent_state = kv_cache.recurrent_states[layer_idx] if has_conv_cache else None
-                hidden_states, _, new_conv_state, new_recurrent_state = layer(
-                    hidden_states,
-                    attention_mask=None if has_cache else attention_mask,
-                    positions=positions,
-                    adapter_indices=adapter_indices,
-                    conv_state=conv_state,
-                    recurrent_state=recurrent_state,
-                )
-                assert new_conv_state is not None and new_recurrent_state is not None
-                updated_conv_states.append(new_conv_state)
-                updated_recurrent_states.append(new_recurrent_state)
-                updated_keys.append(
-                    kv_cache.keys[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
-                )
-                updated_values.append(
-                    kv_cache.values[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
-                )
+
+                if self.layer_types[layer_idx] == "full_attention":
+                    layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx]) if has_cache else None
+                    hidden_states, updated_kv, _, _ = layer(
+                        hidden_states,
+                        attention_mask=attention_mask,
+                        positions=positions,
+                        adapter_indices=adapter_indices,
+                        kv_cache=layer_kv,
+                    )
+                    assert updated_kv is not None
+                    updated_keys.append(updated_kv[0])
+                    updated_values.append(updated_kv[1])
+                    updated_conv_states.append(
+                        kv_cache.conv_states[layer_idx]
+                        if has_conv_cache
+                        else jnp.zeros((batch_size, 0, 0), dtype=dtype)
+                    )
+                    updated_recurrent_states.append(
+                        kv_cache.recurrent_states[layer_idx]
+                        if has_conv_cache
+                        else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
+                    )
+                else:
+                    conv_state = kv_cache.conv_states[layer_idx] if has_conv_cache else None
+                    recurrent_state = kv_cache.recurrent_states[layer_idx] if has_conv_cache else None
+                    hidden_states, _, new_conv_state, new_recurrent_state = layer(
+                        hidden_states,
+                        attention_mask=None if has_cache else attention_mask,
+                        positions=positions,
+                        adapter_indices=adapter_indices,
+                        conv_state=conv_state,
+                        recurrent_state=recurrent_state,
+                    )
+                    assert new_conv_state is not None and new_recurrent_state is not None
+                    updated_conv_states.append(new_conv_state)
+                    updated_recurrent_states.append(new_recurrent_state)
+                    updated_keys.append(
+                        kv_cache.keys[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
+                    )
+                    updated_values.append(
+                        kv_cache.values[layer_idx] if has_cache else jnp.zeros((batch_size, 0, 0, 0), dtype=dtype)
+                    )
 
         hidden_states = self.norm(hidden_states)
         if output_hidden_states:
