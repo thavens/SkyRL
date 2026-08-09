@@ -5,7 +5,7 @@ import math
 import jax
 from flax import nnx
 from jax import numpy as jnp
-from jax.sharding import get_abstract_mesh
+from jax.sharding import NamedSharding, PartitionSpec, get_abstract_mesh, get_mesh
 
 from skyrl.tx.layers.attention import dot_product_attention
 from skyrl.tx.layers.lora import FusedLoRALinear, LoRAEmbed, LoRALinear
@@ -374,7 +374,25 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.conv_dim = self.key_dim * 2 + self.value_dim
         self.chunk_size = config.linear_attention_chunk_size
 
-        # Keep linear-attention projections replicated across TP for simplicity/stability.
+        tp = get_abstract_mesh().shape.get("tp", 1)
+        if config.shard_attention_heads:
+            assert self.num_v_heads % tp == 0, f"num_v_heads={self.num_v_heads} must be divisible by tp={tp}"
+            assert self.num_k_heads % tp == 0, f"num_k_heads={self.num_k_heads} must be divisible by tp={tp}"
+        self.tp_shard = "tp" if config.shard_attention_heads else None
+        # Capture the construction-time mesh as concrete NamedShardings so __call__ can constrain
+        # the per-head delta-rule activations even with no mesh in context (e.g. eager test
+        # forwards). A NamedSharding needs no active mesh at call time; a bare PartitionSpec does.
+        if self.tp_shard is not None:
+            mesh = get_mesh()
+            self.head_sharding = NamedSharding(mesh, PartitionSpec(None, None, self.tp_shard, None))  # [B, T, H, D]
+            self.seq_sharding = NamedSharding(mesh, PartitionSpec(None, None, self.tp_shard))  # [B, T, H]
+        else:
+            self.head_sharding = None
+            self.seq_sharding = None
+
+        # in_proj_qkv and conv1d_weight pack q/k/v contiguously with unequal head counts, so they
+        # can't be split cleanly by head — keep them replicated across TP. Everything else
+        # (z/b/a/dt_bias/A_log/out_proj) plus the per-head delta-rule activations shards by head.
         self.in_proj_qkv = LoRALinear(
             self.hidden_size,
             self.conv_dim,
@@ -390,7 +408,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.in_proj_z = LoRALinear(
             self.hidden_size,
             self.value_dim,
-            sharding=("fsdp", None),
+            sharding=("fsdp", self.tp_shard),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -402,7 +420,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.in_proj_b = LoRALinear(
             self.hidden_size,
             self.num_v_heads,
-            sharding=("fsdp", None),
+            sharding=("fsdp", self.tp_shard),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -414,7 +432,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.in_proj_a = LoRALinear(
             self.hidden_size,
             self.num_v_heads,
-            sharding=("fsdp", None),
+            sharding=("fsdp", self.tp_shard),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -436,7 +454,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.dt_bias = Param(
             self.num_v_heads,
             dtype=dtype,
-            kernel_init=nnx.with_partitioning(nnx.initializers.ones_init(), (None,)),
+            kernel_init=nnx.with_partitioning(nnx.initializers.ones_init(), (self.tp_shard,)),
             rngs=rngs,
         )
         self.A_log = Param(
@@ -446,7 +464,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
                 lambda key, shape, dtype: jnp.log(
                     jax.random.uniform(key, shape, dtype=dtype, minval=1e-3, maxval=16.0)
                 ),
-                (None,),
+                (self.tp_shard,),
             ),
             rngs=rngs,
         )
@@ -455,7 +473,7 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
         self.out_proj = LoRALinear(
             self.value_dim,
             self.hidden_size,
-            sharding=(None, "fsdp"),
+            sharding=(self.tp_shard, "fsdp"),
             max_lora_adapters=config.max_lora_adapters,
             max_lora_rank=config.max_lora_rank,
             dtype=dtype,
@@ -536,6 +554,18 @@ class Qwen3_5GatedDeltaNet(nnx.Module):
             repeats = self.num_v_heads // self.num_k_heads
             query = jnp.repeat(query, repeats, axis=2)
             key = jnp.repeat(key, repeats, axis=2)
+
+        # query/key/value come from the replicated in_proj_qkv->conv, so XLA won't reliably push
+        # head-sharding into the scan + triangular_solve. Constrain them (and z/g/beta) onto the
+        # head axis so the recurrent state and chunk intermediates split per device; out_proj
+        # all-reduces. replicated -> sharded here is free (each device drops the other heads' slice).
+        if self.head_sharding is not None:
+            query = jax.lax.with_sharding_constraint(query, self.head_sharding)
+            key = jax.lax.with_sharding_constraint(key, self.head_sharding)
+            value = jax.lax.with_sharding_constraint(value, self.head_sharding)
+            z = jax.lax.with_sharding_constraint(z, self.head_sharding)
+            g = jax.lax.with_sharding_constraint(g, self.seq_sharding)
+            beta = jax.lax.with_sharding_constraint(beta, self.seq_sharding)
 
         # Use chunked version for prefill (better parallelization), recurrent for decode
         if seq_len > 1:
