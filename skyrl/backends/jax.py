@@ -163,9 +163,15 @@ class AccumulatedGradients:
 
     @classmethod
     def create(cls, lora_params: nnx.State, max_adapters: int) -> "AccumulatedGradients":
-        """Initialize with zeros."""
+        """Initialize with zeros.
+
+        The accumulation buffer is kept in fp32 even though the LoRA params (and
+        thus the incoming grads) are bf16: summing many micro-batch grads in bf16
+        loses small updates to rounding. add() upcasts the bf16 grads into this
+        fp32 buffer; get_mean() stays fp32 (it casts the count with .astype(g.dtype)).
+        """
         return cls(
-            grad_sum=jax.tree.map(jnp.zeros_like, lora_params),
+            grad_sum=jax.tree.map(lambda p: jnp.zeros_like(p, dtype=jnp.float32), lora_params),
             counts=jnp.zeros((max_adapters,), dtype=jnp.int32),
         )
 
