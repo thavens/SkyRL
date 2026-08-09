@@ -1,11 +1,11 @@
 """Tests for the Tinker API mock server using the real tinker client."""
 
-import asyncio
 import os
+import socket
 import subprocess
 import tempfile
 import urllib.request
-from contextlib import contextmanager
+from contextlib import closing, contextmanager
 from urllib.parse import urlparse
 
 import pytest
@@ -15,17 +15,32 @@ from transformers import AutoTokenizer
 
 from skyrl.tinker.api import _build_uv_run_cmd_engine
 from skyrl.tinker.config import EngineConfig
-from tests.tinker.conftest import api_server_is_up, wait_for_condition
+from tests.tinker.conftest import api_server_is_up, unload_model, wait_for_condition
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
 
 
-TEST_SERVER_PORT = 8000
+# Test servers bind loopback only -- they have no authentication and can write
+# files, so they must never be reachable off-box.
+TEST_SERVER_HOST = "127.0.0.1"
 
 # Configs for the fast cleanup test
-TEST_SERVER_PORT_FAST_CLEANUP = 8001
 FAST_CLEANUP_INTERVAL_SEC = 1  # How often to check for stale sessions
 FAST_CLEANUP_TIMEOUT_SEC = 3  # Seconds without heartbeat before session is stale
+
+
+def _free_port() -> int:
+    """Reserve an ephemeral loopback port and return it.
+
+    A fixed port lets a test silently attach to somebody else's server when the bind
+    fails -- the client just connects to whatever already holds the port. Since
+    ``api_server`` is function-scoped, a fixed port also races each test's teardown
+    against the next test's bind. Asking the kernel for a free one avoids both.
+    """
+    with closing(socket.socket(socket.AF_INET, socket.SOCK_STREAM)) as sock:
+        sock.bind((TEST_SERVER_HOST, 0))
+        return sock.getsockname()[1]
+
 
 TINKER_API_KEY = "tml-dummy"
 
@@ -57,23 +72,31 @@ def start_api_server(
 ):
     """Start the FastAPI server with optional config overrides. Prints log on failure.
 
+    Yields ``(process, log_path, base_url)``. The server gets its own ephemeral
+    loopback port, so tests can never end up driving a server this helper did not
+    launch.
+
     Pass ``db_path`` to keep the SQLite file alive past the context (e.g. for tests
     that inspect persisted state after server shutdown).
     """
     with tempfile.TemporaryDirectory() as tmp_dir:
         log_path = os.path.join(tmp_dir, "server.log")
         resolved_db_path = db_path if db_path is not None else os.path.join(tmp_dir, "server.db")
+        port = _free_port()
+        base_url = f"http://{TEST_SERVER_HOST}:{port}/"
 
         with open(log_path, "w") as log_file:
             defaults = {
-                "host": "0.0.0.0",
-                "port": str(TEST_SERVER_PORT),
+                "host": TEST_SERVER_HOST,
+                "port": str(port),
                 "base-model": BASE_MODEL,
                 "backend-config": '{"max_lora_adapters": 4}',
                 "database-url": f"sqlite:///{resolved_db_path}",
             }
             if overrides:
                 defaults.update(overrides)
+                # base_url is built from the reserved port, so it always wins.
+                defaults["port"] = str(port)
             cmd = ["uv", "run"]
             for extra in extras:
                 cmd.extend(["--extra", extra])
@@ -84,12 +107,11 @@ def start_api_server(
             print(f"Starting API server: {' '.join(cmd)}")
             try:
                 if wait_for_up:
-                    port = int(defaults["port"])
                     if not wait_for_condition(lambda: api_server_is_up(port), timeout_sec=180, poll_interval_sec=2):
                         with open(log_path) as f:
                             print(f"=== Server failed to start ===\n{f.read()}")
                         pytest.fail("Tinker API server did not come up in time")
-                yield process, log_path
+                yield process, log_path, base_url
             except Exception:
                 with open(log_path) as f:
                     print(f"=== Test failed. Server log ({log_path}) ===\n{f.read()}")
@@ -123,7 +145,7 @@ def api_server():
 @pytest.fixture
 def service_client(api_server):
     """Create a service client connected to the test server."""
-    return tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_SERVER_PORT}/", api_key=TINKER_API_KEY)
+    return tinker.ServiceClient(base_url=api_server[2], api_key=TINKER_API_KEY)
 
 
 def make_datum(tokenizer, prompt: str, completion: str, weight: tuple[float, float] | None = (0.0, 1.0)):
@@ -282,8 +304,8 @@ def test_delete_checkpoint(tmp_path):
         overrides={"checkpoints-base": str(checkpoints_base)},
         wait_for_up=True,
         teardown_timeout=20.0,
-    ):
-        service_client = tinker.ServiceClient(base_url=f"http://0.0.0.0:{TEST_SERVER_PORT}/", api_key=TINKER_API_KEY)
+    ) as (_, _, base_url):
+        service_client = tinker.ServiceClient(base_url=base_url, api_key=TINKER_API_KEY)
         training_client = service_client.create_lora_training_client(base_model=BASE_MODEL)
         rest_client = service_client.create_rest_client()
 
@@ -536,7 +558,6 @@ def api_server_fast_cleanup():
     """Start the FastAPI server with fast cleanup settings for testing."""
     with start_api_server(
         overrides={
-            "port": str(TEST_SERVER_PORT_FAST_CLEANUP),
             "session-cleanup-interval-sec": str(FAST_CLEANUP_INTERVAL_SEC),
             "session-timeout-sec": str(FAST_CLEANUP_TIMEOUT_SEC),
         },
@@ -546,33 +567,11 @@ def api_server_fast_cleanup():
 
 def test_unload_model(api_server):
     """Test that unload_model properly unloads a model."""
+    base_url = api_server[2]
     # Create a training client (which creates a model) and verify it works
-    _, training_client = create_service_and_training_client(base_url=f"http://0.0.0.0:{TEST_SERVER_PORT}/")
+    _, training_client = create_service_and_training_client(base_url=base_url)
 
-    async def unload_model():
-        async with tinker._client.AsyncTinker(
-            api_key=TINKER_API_KEY, base_url=f"http://0.0.0.0:{TEST_SERVER_PORT}/"
-        ) as client:
-            future = await client.models.unload(request=types.UnloadModelRequest(model_id=training_client.model_id))
-            while True:
-                # NOTE: ``futures.retrieve`` casts to the ``FutureRetrieveResponse``
-                # union, which has no discriminator. tinker>=0.17 resolves such a
-                # union to its first member (``TryAgainResponse``) regardless of the
-                # payload, so ``isinstance(result, UnloadModelResponse)`` is never
-                # true and this loop spins forever. Read the raw body instead and
-                # dispatch on the server's ``type`` field. (The high-level
-                # ``APIFuture.result()`` path is unaffected; it deserializes into a
-                # concrete type rather than the union.)
-                response = await client.futures.with_raw_response.retrieve(
-                    request=types.FutureRetrieveRequest(request_id=future.request_id)
-                )
-                body = await response.json()
-                if body.get("type") == "try_again":
-                    await asyncio.sleep(0.1)
-                    continue
-                return body
-
-    result = asyncio.run(unload_model())
+    result = unload_model(base_url, training_client.model_id, api_key=TINKER_API_KEY)
     assert result["type"] == "unload_model"
     assert result["model_id"] == training_client.model_id
 
@@ -588,8 +587,7 @@ def test_stale_session_cleanup(api_server_fast_cleanup):
     adapter slot reuse, since that behavior is already covered by unit tests in
     test_jax_backend.py and test_engine.py.
     """
-    _, log_path = api_server_fast_cleanup
-    base_url = f"http://0.0.0.0:{TEST_SERVER_PORT_FAST_CLEANUP}/"
+    _, log_path, base_url = api_server_fast_cleanup
     # Skip verification because we've reduced cleanup timeout in this test.
     # When running on a slow machine, the model may have already be cleaned
     # up at verification time.

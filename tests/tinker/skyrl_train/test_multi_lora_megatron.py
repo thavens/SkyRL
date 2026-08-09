@@ -31,7 +31,6 @@ Run with:
 
 from __future__ import annotations
 
-import asyncio
 import json
 import os
 import subprocess
@@ -53,7 +52,7 @@ pytestmark = pytest.mark.skipif(not cuda_available, reason="multi-LoRA Megatron 
 tinker = pytest.importorskip("tinker")
 from tinker import types as tinker_types  # noqa: E402
 
-from tests.tinker.conftest import wait_for_condition  # noqa: E402
+from tests.tinker.conftest import unload_model, wait_for_condition  # noqa: E402
 
 BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
 TINKER_API_KEY = "tml-dummy"
@@ -281,16 +280,7 @@ def test_delete_then_train_remaining(service_client):
 
     # Delete A via the unload_model endpoint (Tinker exposes this as the
     # public deletion path).
-    async def _unload(model_id: str):
-        async with tinker._client.AsyncTinker(  # type: ignore[attr-defined]
-            api_key=TINKER_API_KEY, base_url=f"http://0.0.0.0:{TEST_PORT}/"
-        ) as client:
-            future = await client.models.unload(request=tinker_types.UnloadModelRequest(model_id=model_id))
-            return await client.futures.retrieve(
-                request=tinker_types.FutureRetrieveRequest(request_id=future.request_id)
-            )
-
-    asyncio.run(_unload(a.model_id))
+    unload_model(f"http://0.0.0.0:{TEST_PORT}/", a.model_id, api_key=TINKER_API_KEY)
 
     # B should still train successfully — backend should NOT have done a
     # ray.shutdown when only A was deleted.

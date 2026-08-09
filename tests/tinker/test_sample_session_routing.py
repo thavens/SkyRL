@@ -37,9 +37,9 @@ BASE_MODEL = "trl-internal-testing/tiny-Qwen3ForCausalLM"
 TINKER_API_KEY = "tml-dummy"
 
 
-def _start_jax_api_server(port: int, db_path: str, extra_overrides: dict[str, str] | None = None):
-    """CPU Tinker API server (jax backend) on the given port and DB."""
-    overrides = {"port": str(port), "backend": "jax"}
+def _start_jax_api_server(db_path: str, extra_overrides: dict[str, str] | None = None):
+    """CPU Tinker API server (jax backend) on an ephemeral port, yielding its base URL."""
+    overrides = {"backend": "jax"}
     if extra_overrides:
         overrides.update(extra_overrides)
     return start_api_server(
@@ -95,8 +95,8 @@ def _make_prompt():
     return tinker_types.ModelInput.from_ints(tokenizer.encode("Hello", add_special_tokens=True))
 
 
-def _sample_once(port: int):
-    sc = tinker.ServiceClient(base_url=f"http://0.0.0.0:{port}/", api_key=TINKER_API_KEY)
+def _sample_once(base_url: str):
+    sc = tinker.ServiceClient(base_url=base_url, api_key=TINKER_API_KEY)
     sampler = sc.create_sampling_client(base_model=BASE_MODEL)
     sampler.sample(
         prompt=_make_prompt(),
@@ -129,11 +129,10 @@ def _latest_sample_input(db_path: str) -> types.SampleInput:
 def test_in_process_threads_session_ids_to_sample_input():
     """Default path: asample persists the SDK's sampling_session_id + seq_id,
     and prepare_sample_batch derives the routing key handed to the engine."""
-    port = 8021
     with tempfile.TemporaryDirectory() as db_dir:
         db_path = os.path.join(db_dir, "server.db")
-        with _start_jax_api_server(port, db_path):
-            _sample_once(port)
+        with _start_jax_api_server(db_path) as (_, _, base_url):
+            _sample_once(base_url)
         sample_input = _latest_sample_input(db_path)
 
     # First .sample() on a fresh sampling client → seq_id 0, with the
@@ -149,13 +148,12 @@ def test_in_process_threads_session_ids_to_sample_input():
 def test_external_forwards_session_header():
     """External path: the forwarded /v1/completions request carries
     X-Session-ID derived from the SDK's sampling_session_id + seq_id."""
-    port = 8022
     with _fake_completions_server() as (fake_port, captured_session_ids):
         with tempfile.TemporaryDirectory() as db_dir:
             db_path = os.path.join(db_dir, "server.db")
             overrides = {"external-inference-url": f"http://127.0.0.1:{fake_port}"}
-            with _start_jax_api_server(port, db_path, overrides):
-                _sample_once(port)
+            with _start_jax_api_server(db_path, overrides) as (_, _, base_url):
+                _sample_once(base_url)
 
     assert len(captured_session_ids) >= 1, "fake inference server received no request"
     assert any(

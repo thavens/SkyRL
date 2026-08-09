@@ -253,6 +253,32 @@ class TinkerEngine:
 
         return results, valid_requests
 
+    @staticmethod
+    def _validate_backend_config(config: EngineConfig, backend_config) -> None:
+        """Resolve the sampling route into the backend config, and reject unsafe combinations.
+
+        JAX slot 0 is the zeroed "no LoRA" adapter that base-model sampling routes to. When an
+        external inference server owns sampling, the backend's sampling path is never exercised,
+        so that slot would sit idle holding weights and fp32 optimizer state; the backend hands
+        it to user models instead and all max_lora_adapters slots become usable. This is derived
+        here rather than trusted from --backend-config: releasing the slot while base-model
+        sampling can still reach this backend would silently sample through a trained adapter.
+
+        Without external inference slot 0 stays reserved and N slots serve N-1 models, so
+        max_lora_adapters=1 leaves nothing to allocate and every create_model would fail.
+        """
+        if config.backend != "jax":
+            return
+        external = config.external_inference_url is not None
+        backend_config.external_inference = external
+        if backend_config.max_lora_adapters == 1 and not external:
+            raise ValueError(
+                "max_lora_adapters=1 with no external inference server leaves no usable adapter "
+                "slot: slot 0 stays reserved for base-model sampling, so every create_model "
+                "would fail. Set --external-inference-url to route sampling away from this "
+                "backend and reclaim slot 0, or raise max_lora_adapters to 2."
+            )
+
     def __init__(
         self,
         config: EngineConfig,
@@ -266,6 +292,7 @@ class TinkerEngine:
         use_ray = config.backend_config.get("use_ray", False)
         backend_class, backend_config_class = get_backend_classes(config.backend, use_ray=use_ray)
         backend_config = backend_config_class(**config.backend_config)
+        self._validate_backend_config(config, backend_config)
         self.backend = backend_class(config.base_model, backend_config)
 
         # Backends that support async sample routing notify us when their
