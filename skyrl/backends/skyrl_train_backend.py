@@ -1255,12 +1255,18 @@ class SkyRLTrainBackend(AbstractBackend):
 
         logger.info(f"Loaded checkpoint for {model_id} from {checkpoint_path}")
 
-    def save_sampler_checkpoint(self, output_path, model_id: str, persist: bool = True) -> None:
+    def save_sampler_checkpoint(
+        self, output_path, model_id: str, persist: bool = True, as_directory: bool = False
+    ) -> None:
         """Sync weights to colocated inference engines and optionally save to disk.
 
         The NCCL broadcast always runs so inference engines have the latest
         policy weights.  When ``persist`` is False (the common hot-path in RL
         loops) the expensive HuggingFace model export is skipped entirely.
+
+        ``as_directory`` is accepted for interface parity but ignored: this
+        backend's disk layout (a full HuggingFace model export) is unchanged.
+        Only the JAX backend acts on it.
         """
         self._validate_model_state(model_id)
         if self._get_role(model_id) != "policy":

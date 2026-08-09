@@ -56,8 +56,7 @@ class ExternalInferenceClient:
     def __init__(self, engine_config: EngineConfig, db_engine):
         self.base_url = f"{engine_config.external_inference_url}/v1"
         self.api_key = engine_config.external_inference_api_key
-        self.checkpoints_base = engine_config.checkpoints_base
-        self.lora_base_dir = engine_config.external_inference_lora_base
+        self.config = engine_config
         self.db_engine = db_engine
 
     async def call_and_store_result(
@@ -116,12 +115,17 @@ class ExternalInferenceClient:
             # Base model sampling: use the model name directly, no LoRA checkpoint needed
             model_name = base_model
         else:
-            # LoRA sampling: extract checkpoint and reference it by name for dynamic loading
-            model_name = f"{model_id}_{checkpoint_id}"
-            checkpoint_path = self.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
-            target_dir = self.lora_base_dir / model_name
+            # LoRA sampling: reference the adapter by name for dynamic loading.
+            target_dir = self.config.sampler_adapter_dir(model_id, checkpoint_id)
+            model_name = target_dir.name
 
-            await asyncio.to_thread(_extract_checkpoint_sync, checkpoint_path, target_dir)
+            # The adapter may already be published here as a plain directory (see
+            # EngineConfig.publishes_sampler_adapter_in_place), in which case no extraction is
+            # needed. Otherwise extract the tar.gz -- also the path for pre-existing sampler
+            # checkpoints written before in-place publishing.
+            if not target_dir.exists():
+                checkpoint_path = self.config.sampler_archive_path(model_id, checkpoint_id)
+                await asyncio.to_thread(_extract_checkpoint_sync, checkpoint_path, target_dir)
 
         payload = {
             "model": model_name,

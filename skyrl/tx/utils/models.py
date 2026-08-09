@@ -22,7 +22,11 @@ from skyrl.tinker.types import LoraConfig
 from skyrl.tx.layers.connectors import is_connector_path
 from skyrl.tx.models.configs import ModelConfig
 from skyrl.utils.log import logger
-from skyrl.utils.storage import download_and_unpack, pack_and_upload
+from skyrl.utils.storage import (
+    download_and_unpack,
+    pack_and_upload,
+    write_and_publish_dir,
+)
 
 if TYPE_CHECKING:
     import torch
@@ -338,21 +342,28 @@ def save_lora_checkpoint(
     adapter_index: int,
     output_path: Path | CloudPath,
     rank: int,
+    as_directory: bool = False,
 ):
-    """Save a LoRA checkpoint as a tar.gz archive.
+    """Save a LoRA checkpoint.
 
     Args:
         model: The Qwen3ForCausalLM model to extract LoRA parameters from
         adapter_config: LoRA adapter configuration
         adapter_index: Index of the adapter to save
-        output_path: Path to save the checkpoint tar.gz file
+        output_path: Path to save the checkpoint to. When ``as_directory`` is
+            False this is a tar.gz file; when True it is a directory that
+            external inference engines (vLLM) can load in place.
         rank: The process rank for distributed saving
+        as_directory: If True, publish the adapter as a plain directory
+            (adapter_model.safetensors + adapter_config.json) instead of a
+            tar.gz archive, skipping the pack/un-tar round-trip.
     """
     peft_config = peft.LoraConfig(
         base_model_name_or_path=base_model_name, r=adapter_config.rank, lora_alpha=adapter_config.alpha
     )
 
-    with pack_and_upload(output_path, rank=rank) as temp_dir:
+    ctx = write_and_publish_dir(output_path, rank=rank) if as_directory else pack_and_upload(output_path, rank=rank)
+    with ctx as temp_dir:
 
         save_safetensors(
             model.config,

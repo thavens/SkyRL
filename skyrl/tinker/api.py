@@ -47,7 +47,7 @@ from skyrl.tinker.extra import (
     SkyRLTrainInferenceForwardingClient,
 )
 from skyrl.utils.log import get_uvicorn_log_config, logger
-from skyrl.utils.storage import download_file
+from skyrl.utils.storage import read_as_archive
 
 # Validation patterns for train_run_ids, model_ids and checkpoint_ids
 ID_PATTERN = r"^[a-zA-Z0-9_-]+$"
@@ -1231,10 +1231,21 @@ async def validate_checkpoint(
 def checkpoint_file_path(
     request: Request, unique_id: str, checkpoint_id: str, checkpoint_type: types.CheckpointType
 ) -> Any:
-    checkpoint_dir = request.app.state.engine_config.checkpoints_base / unique_id
+    cfg = request.app.state.engine_config
+
+    # Resolve to the artifact that actually exists: sampler adapters may be published as a
+    # plain directory rather than a tar.gz (see EngineConfig.publishes_sampler_adapter_in_place).
     if checkpoint_type == types.CheckpointType.SAMPLER:
-        checkpoint_dir = checkpoint_dir / "sampler_weights"
-    return checkpoint_dir / f"{checkpoint_id}.tar.gz"
+        if cfg.publishes_sampler_adapter_in_place:
+            adapter_dir = cfg.sampler_adapter_dir(unique_id, checkpoint_id)
+            if adapter_dir.exists():
+                return adapter_dir
+            # Fall through to the archive: checkpoints written before in-place publishing
+            # was enabled only exist as a tar.gz. The external inference forwarder falls
+            # back the same way, so download/delete stay consistent with what can be sampled.
+        return cfg.sampler_archive_path(unique_id, checkpoint_id)
+
+    return cfg.checkpoints_base / unique_id / f"{checkpoint_id}.tar.gz"
 
 
 def parse_checkpoint_delete_path(
@@ -1347,7 +1358,7 @@ async def download_checkpoint_archive(
         request, unique_id, checkpoint_id, types.CheckpointType.SAMPLER, session
     )
 
-    file_buffer = await asyncio.to_thread(download_file, checkpoint_path)
+    file_buffer = await asyncio.to_thread(read_as_archive, checkpoint_path)
 
     filename = f"{unique_id}_{checkpoint_id}.tar.gz"
     headers = {

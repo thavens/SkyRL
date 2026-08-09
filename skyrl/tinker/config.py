@@ -69,6 +69,30 @@ class EngineConfig(BaseModel):
         description="Seconds without heartbeat before session is considered stale. Set to -1 to disable cleanup.",
     )
 
+    @property
+    def publishes_sampler_adapter_in_place(self) -> bool:
+        """Whether sampler checkpoints are published as a plain directory rather than a tar.gz.
+
+        The JAX backend writes the adapter straight to the directory the external engine
+        loads it from, skipping the tar pack -> read-back -> un-tar round-trip the external
+        inference forwarder would otherwise do. Other backends ignore ``as_directory`` and
+        the non-external path has nowhere to publish to, so both keep the tar layout.
+        """
+        return self.backend == "jax" and self.external_inference_url is not None
+
+    def sampler_adapter_dir(self, model_id: str, checkpoint_id: str) -> Path:
+        """Directory the external inference engine loads this sampler adapter from.
+
+        The name doubles as the ``lora_name`` registered with the engine, so the writer
+        (:meth:`~skyrl.tinker.engine.TinkerEngine.process_save_weights_for_sampler`) and the
+        forwarder must agree on it -- hence one definition here rather than one per caller.
+        """
+        return self.external_inference_lora_base / f"{model_id}_{checkpoint_id}"
+
+    def sampler_archive_path(self, model_id: str, checkpoint_id: str) -> AnyPath:
+        """Path of the tar.gz sampler checkpoint, used whenever it is not published in place."""
+        return self.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
+
 
 def convert_env_var(env_name: str, env_value: str, expected_type: type):
     """Convert environment variable to expected type."""

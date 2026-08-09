@@ -676,15 +676,24 @@ class TinkerEngine:
 
         # Make sure the user cannot store checkpoints in places like ../../<important file>
         checkpoint_id = Path(request_data.path).name
-        output_path = self.config.checkpoints_base / model_id / "sampler_weights" / f"{checkpoint_id}.tar.gz"
 
         # When the caller provides a sampling_session_seq_id the save is
-        # transient — weights only need to reach the inference engines, not
-        # disk.  Backends can skip the expensive write in that case.
-        persist = request_data.sampling_session_seq_id is None
+        # usually transient — weights only need to reach the inference engines,
+        # not disk.  Backends can skip the expensive write in that case. With an
+        # external inference engine the adapter must exist on disk for the engine
+        # to load it, so the write always happens.
+        persist = self.config.external_inference_url is not None or request_data.sampling_session_seq_id is None
+
+        # Publish the adapter where the forwarder expects to find it. See
+        # EngineConfig.publishes_sampler_adapter_in_place for why the two layouts exist.
+        as_directory = self.config.publishes_sampler_adapter_in_place
+        if as_directory:
+            output_path = self.config.sampler_adapter_dir(model_id, checkpoint_id)
+        else:
+            output_path = self.config.sampler_archive_path(model_id, checkpoint_id)
 
         with self._checkpoint_status_context(model_id, checkpoint_id, types.CheckpointType.SAMPLER):
-            self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist)
+            self.backend.save_sampler_checkpoint(output_path, model_id, persist=persist, as_directory=as_directory)
             logger.info(f"Saved sampler checkpoint for model {model_id} to {output_path}")
 
         # Return path=None when using sampling_session_seq_id and seq_id (SDK expects this)
