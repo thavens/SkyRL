@@ -202,7 +202,12 @@ class ExternalInferenceClient:
             headers["X-Session-ID"] = session_id
 
         response = await http_client.post("/completions", json=payload, headers=headers)
-        response.raise_for_status()
+        if response.status_code >= 400:
+            # Surface the engine's error body: vLLM 400s carry the actual reason
+            # (over-cap logprobs, context overflow, greedy n>1, ...) and a bare
+            # raise_for_status turns them all into an undiagnosable status line.
+            detail = response.text[:500]
+            raise RuntimeError(f"vLLM /completions returned {response.status_code}: {detail}")
         result = response.json()
 
         # The request succeeded, so this adapter is definitely resident; retire the one it
