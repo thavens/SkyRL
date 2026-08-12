@@ -1204,13 +1204,48 @@ class JaxBackendImpl(AbstractBackend):
             counts=self.adam_state.counts.at[adapter_index].set(jnp.int32(optimizer_state["count"])),
         )
 
+    def _restore_weights_only(self, checkpoint_path: AnyPath, model_id: str) -> dict | None:
+        """Restore a checkpoint whose optimizer subtree this build cannot interpret.
+
+        Reads the payload untyped and keeps only the LoRA weights, substituting zeroed
+        Adam moments for the incompatible optimizer state.
+        """
+        raw = checkpoints.restore_checkpoint(ckpt_dir=checkpoint_path, target=None, prefix="checkpoint_")
+        if raw is None:
+            return None
+        if "lora_weights" not in raw:
+            raise ValueError(f"Checkpoint at {checkpoint_path} has no 'lora_weights' entry; cannot recover it")
+        current = self._extract_checkpoint_data(model_id)
+        return {
+            "lora_weights": raw["lora_weights"],
+            "lora_config": raw.get("lora_config", current["lora_config"]),
+            "optimizer_state": jax.tree.map(jnp.zeros_like, current["optimizer_state"]),
+        }
+
     def load_checkpoint(self, checkpoint_path: AnyPath, model_id: str) -> None:
         """Load training checkpoint using Flax checkpoints."""
-        checkpoint = checkpoints.restore_checkpoint(
-            ckpt_dir=checkpoint_path,
-            target=self._extract_checkpoint_data(model_id),
-            prefix="checkpoint_",
-        )
+        try:
+            checkpoint = checkpoints.restore_checkpoint(
+                ckpt_dir=checkpoint_path,
+                target=self._extract_checkpoint_data(model_id),
+                prefix="checkpoint_",
+            )
+        except (ValueError, KeyError, TypeError) as e:
+            # Checkpoints written before the shared slot-masked AdamW carry the old
+            # per-model optax optimizer tree under "optimizer_state", so restore_checkpoint's
+            # structural match against the current target fails. The LoRA weights themselves
+            # are unaffected, so recover those instead of failing the resume outright:
+            # restarting Adam costs a few steps of warmup, not the run.
+            #
+            # Deliberately not `except Exception`: these three are what flax's from_state_dict
+            # raises on a structure/shape mismatch, while OSError and friends mean the file is
+            # truncated, absent or unreadable -- those must stay loud rather than silently
+            # resurfacing as "optimizer state reset".
+            logger.warning(
+                f"Typed restore of {checkpoint_path} failed ({type(e).__name__}: {e}); "
+                "falling back to a weights-only restore -- optimizer state will be reset"
+            )
+            checkpoint = self._restore_weights_only(checkpoint_path, model_id)
 
         if checkpoint is None:
             raise FileNotFoundError(f"Training checkpoint not found in {checkpoint_path}")
