@@ -69,6 +69,12 @@ async def handle(request: web.Request) -> web.StreamResponse:
     last_error = None
     # Retry on a different replica only while no bytes have reached the client:
     # once the response has started, the request is no longer safe to replay.
+    # `started` flips once prepare() has put status+headers on the wire, which is
+    # the point of no return -- a mid-stream failure after that must propagate,
+    # because re-preparing a second StreamResponse on an already-started request
+    # raises inside aiohttp and the client sees a truncated body plus a hard
+    # connection error instead of the 502 this fall-through is meant to produce.
+    started = False
     for backend in bal.order():
         url = backend + request.path_qs
         bal.inflight[backend] += 1
@@ -81,15 +87,20 @@ async def handle(request: web.Request) -> web.StreamResponse:
                     if k.lower() not in HOP_BY_HOP:
                         out.headers[k] = v
                 await out.prepare(request)
+                started = True
                 async for chunk in upstream.content.iter_chunked(65536):
                     await out.write(chunk)
                 await out.write_eof()
                 bal.served[backend] += 1
                 return out
         except (OSError, asyncio.TimeoutError) as e:
-            # Connection-level failure with nothing written yet: try the next replica.
             bal.failed[backend] += 1
             last_error = f"{backend}: {type(e).__name__}: {e}"
+            if started:
+                # Response already on the wire: cannot fail over, cannot send a 502.
+                # Dropping the connection is the only honest signal left, and it
+                # is what lets the client tell a truncated answer from a complete one.
+                raise
         finally:
             bal.inflight[backend] -= 1
 

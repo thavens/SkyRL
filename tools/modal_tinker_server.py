@@ -1,9 +1,12 @@
 """Tinker API server on Modal: Qwen3.5-9B-Base, 8 trainable LoRAs, 4096 tokens.
 
-Topology (one container, two RTX PRO 6000 on the same physical machine):
+Topology (one container, one 192 GB B200 shared by both roles):
 
     GPU 0   Tinker/JAX trainer, TP=1, 8 trainable LoRA slots     127.0.0.1:8001
-    GPU 1   vLLM sampler, TP=1, --max-loras 8                    127.0.0.1:8000
+    GPU 0   vLLM sampler, TP=1, --max-loras 8                    127.0.0.1:8000
+
+The memory split between the co-resident processes is defined below
+(TRAINER_MEM_FRACTION / SAMPLER_MEM_UTILIZATION).
 
 Both roles live in one container on purpose. The trainer hands vLLM a filesystem
 *path* to each adapter (skyrl/tinker/extra/external_inference.py:145-157), so the
@@ -27,6 +30,7 @@ Then locally:
     python -c "import tinker; print(tinker.ServiceClient().get_server_capabilities())"
 """
 
+import hmac
 import json
 import os
 import subprocess
@@ -532,7 +536,10 @@ def server():
         return JSONResponse({**_state, "model": MODEL_REPO, "max_lora_adapters": MAX_LORA_ADAPTERS})
 
     async def proxy(request):
-        if request.headers.get("x-api-key") != api_key:
+        # compare_digest, not !=: this is the only authentication control in front of a
+        # service that can write under --checkpoints-base and delete any tenant's
+        # checkpoints, so the key comparison should not short-circuit on first mismatch.
+        if not hmac.compare_digest(request.headers.get("x-api-key") or "", api_key):
             return JSONResponse({"detail": "unauthorized"}, status_code=401)
         if _state["stage"] != "ready":
             if _state["error"]:

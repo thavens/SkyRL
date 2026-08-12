@@ -3,11 +3,20 @@
 Workflow:
   1. Connect to the running tinker server via the Tinker SDK.
   2. Create a LoRA model at the adapter's rank (server hardcodes alpha=32).
-  3. Save a placeholder sampler checkpoint to materialize the tar.gz path.
-  4. Overwrite that tar.gz with the adapter weights, padding any LoRA modules
+  3. Save a placeholder sampler checkpoint to materialize the artifact path.
+  4. Overwrite that artifact with the adapter weights, padding any LoRA modules
      that the skyrl-tx Llama-3 model expects but the PEFT adapter omits
      (q/k/v/o for attn, gate/up/down for MLP). Missing slots get zeros so
      they're behavioral no-ops.
+
+     Servers publish sampler adapters in one of two layouts, so which artifact
+     the placeholder produced decides where the weights go. A jax backend with
+     --external-inference-url writes a plain directory under
+     --external-inference-lora-base and no tar.gz at all (see
+     EngineConfig.publishes_sampler_adapter_in_place); everything else writes
+     checkpoints_base/<model_id>/sampler_weights/<id>.tar.gz. Writing to the
+     wrong one leaves the zeroed placeholder in place and the import silently
+     has no effect, so this tool detects the layout instead of assuming.
   5. Pre-scale lora_B by (adapter_alpha / 32) to compensate for the server
      hardcoding alpha=32; final scaling at sampling time becomes
      (32 / rank) * (adapter_alpha / 32) = adapter_alpha / rank, matching PEFT.
@@ -27,12 +36,14 @@ import os
 from pathlib import Path
 
 import numpy as np
+import peft
 import safetensors.numpy
 import safetensors.torch
 import tinker
 import torch
 
-from skyrl.utils.storage import pack_and_upload
+from skyrl.tinker.config import EngineConfig
+from skyrl.utils.storage import pack_and_upload, write_and_publish_dir
 
 SERVER_HARDCODED_ALPHA = 32.0  # see skyrl/tinker/api.py: create_model
 
@@ -102,30 +113,40 @@ def pad_and_rescale(
     return out
 
 
-def pack_tarball(
-    tensors: dict[str, np.ndarray], adapter_alpha: float, rank: int, base_model_name: str, dest: Path
+def write_adapter(
+    tensors: dict[str, np.ndarray],
+    adapter_alpha: float,
+    rank: int,
+    base_model_name: str,
+    dest: Path,
+    as_directory: bool,
 ) -> None:
-    """Write a tar.gz at `dest` containing adapter_model.safetensors + adapter_config.json.
+    """Write the adapter to `dest`, as a plain directory or a tar.gz.
 
-    Uses the same packer the server does, so the archive layout cannot drift from what
-    `save_lora_checkpoint` writes and `download_and_unpack` expects.
+    Mirrors `skyrl.tx.utils.models.save_lora_checkpoint`: same choice of context manager,
+    and the same `peft.LoraConfig` writer for adapter_config.json, so neither the archive
+    layout nor the config contents can drift from what the server produces and vLLM reads.
     """
-    with pack_and_upload(dest) as tmp_path:
+    ctx = write_and_publish_dir(dest) if as_directory else pack_and_upload(dest)
+    with ctx as tmp_path:
         safetensors.numpy.save_file(tensors, str(tmp_path / "adapter_model.safetensors"))
-        adapter_cfg = {
-            "base_model_name_or_path": base_model_name,
-            "r": rank,
-            "lora_alpha": adapter_alpha,
-            "peft_type": "LORA",
-        }
-        (tmp_path / "adapter_config.json").write_text(json.dumps(adapter_cfg))
-    print(f"  Wrote tarball -> {dest}")
+        peft.LoraConfig(base_model_name_or_path=base_model_name, r=rank, lora_alpha=adapter_alpha).save_pretrained(
+            str(tmp_path)
+        )
+    print(f"  Wrote {'adapter directory' if as_directory else 'tarball'} -> {dest}")
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--server", default="http://localhost:8000")
-    parser.add_argument("--api-key", default="tml-dummy")
+    # Defaults from the environment so the key need not appear in argv, which is
+    # world-readable via `ps` on a shared box. --api-key still works for local servers
+    # that ignore it (the loopback deployments in runbook.md take any value).
+    parser.add_argument(
+        "--api-key",
+        default=os.environ.get("TINKER_API_KEY", "tml-dummy"),
+        help="Defaults to $TINKER_API_KEY. Prefer the env var over the flag on shared hosts.",
+    )
     parser.add_argument(
         "--base-model", required=True, help="The --base-model the server was launched with (path or HF id)."
     )
@@ -137,6 +158,14 @@ def main() -> None:
     parser.add_argument("--checkpoint-id", default="v1")
     parser.add_argument(
         "--checkpoints-base", default="/tmp/skyrl_checkpoints", help="Must match the server's --checkpoints-base."
+    )
+    parser.add_argument(
+        "--lora-base",
+        default="/tmp/lora_models",
+        help=(
+            "Must match the server's --external-inference-lora-base. Only used when the "
+            "server publishes sampler adapters in place (jax backend + external inference)."
+        ),
     )
     parser.add_argument("--out", default=None, help="Optional file to write the resulting tinker:// URI.")
     args = parser.parse_args()
@@ -181,11 +210,35 @@ def main() -> None:
     training_client.save_weights_for_sampler(name=args.checkpoint_id).result()
     print("  Placeholder checkpoint registered in DB.")
 
-    tar_path = Path(args.checkpoints_base) / model_id / "sampler_weights" / f"{args.checkpoint_id}.tar.gz"
-    print(f"\nOverwriting {tar_path} with padded adapter weights...")
-    if not tar_path.exists():
-        print(f"  WARNING: placeholder tar not found at {tar_path}; writing anyway.")
-    pack_tarball(padded, adapter_alpha, rank, base_name, tar_path)
+    # Whichever artifact the placeholder actually produced tells us the server's layout.
+    # Both paths come from EngineConfig so this tool cannot desync from the server's own
+    # naming (config.py owns the single definition of each layout).
+    layout = EngineConfig(
+        base_model=args.base_model,
+        checkpoints_base=args.checkpoints_base,
+        external_inference_lora_base=args.lora_base,
+    )
+    tar_path = Path(str(layout.sampler_archive_path(model_id, args.checkpoint_id)))
+    dir_path = layout.sampler_adapter_dir(model_id, args.checkpoint_id)
+
+    if dir_path.exists():
+        print(f"\nServer publishes adapters in place; overwriting {dir_path}...")
+        write_adapter(padded, adapter_alpha, rank, base_name, dir_path, as_directory=True)
+        artifact_path = dir_path
+    elif tar_path.exists():
+        print(f"\nOverwriting {tar_path} with padded adapter weights...")
+        write_adapter(padded, adapter_alpha, rank, base_name, tar_path, as_directory=False)
+        artifact_path = tar_path
+    else:
+        # Writing anyway would produce a file nothing reads, leaving the zeroed
+        # placeholder live -- the import would look successful and do nothing.
+        raise SystemExit(
+            "Could not find the placeholder sampler checkpoint in either layout:\n"
+            f"  directory: {dir_path}\n"
+            f"  archive:   {tar_path}\n"
+            "Check --lora-base / --checkpoints-base against the server's "
+            "--external-inference-lora-base / --checkpoints-base."
+        )
 
     tinker_uri = f"tinker://{model_id}/sampler_weights/{args.checkpoint_id}"
     print("\n✅ Done. Use this from clients:")
@@ -202,7 +255,7 @@ def main() -> None:
                     "base_model": args.base_model,
                     "rank": rank,
                     "alpha": adapter_alpha,
-                    "tar_path": str(tar_path),
+                    "artifact_path": str(artifact_path),
                 },
                 indent=2,
             )
