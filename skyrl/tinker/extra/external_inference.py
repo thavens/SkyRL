@@ -1,6 +1,7 @@
 import asyncio
 import errno
 import itertools
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -19,6 +20,14 @@ from skyrl.utils.storage import download_and_unpack
 
 if TYPE_CHECKING:
     from skyrl.tinker.api import SampleRequest
+
+
+@dataclass
+class _AdapterUse:
+    """How recently an adapter was sampled, and whether it is busy right now."""
+
+    last_seq: int = -1
+    inflight: int = 0
 
 
 def _extract_checkpoint_sync(checkpoint_path: AnyPath, target_dir: Path) -> None:
@@ -62,46 +71,68 @@ class ExternalInferenceClient:
         # RL refreshes the sampler adapter every optimizer step, each under a new
         # checkpoint_id, and vLLM's filesystem resolver loads them on demand but never
         # unloads -- so adapters pile up (one per step) until the engine wedges (GPU
-        # pinned, no completions). Track the live adapter per model and unload the prior
-        # one when it rolls over, so vLLM only ever holds the current adapter.
-        self._live_lora: dict[str, tuple[int, str]] = {}
+        # pinned, no completions). Track per-adapter usage and unload the ones that have
+        # gone quiet, so vLLM holds only adapters that are actually being sampled.
+        #
+        # Tracked per adapter name (which embeds both model_id and checkpoint_id) rather than
+        # per model_id: one model can legitimately have two live checkpoints at once -- an
+        # eval client pinned to an older checkpoint while training publishes new ones -- and
+        # a single "current adapter" per model makes those two unload each other in a loop.
+        self._lora_use: dict[str, dict[str, _AdapterUse]] = {}  # model_id -> name -> usage
         self._lora_seq = itertools.count()
         self._lora_lock = asyncio.Lock()
 
-    async def _retire_previous_adapter(
-        self, model_id: str, model_name: str, seq: int, http_client: httpx.AsyncClient
-    ) -> None:
-        """Unload the model's previous adapter now that ``model_name`` has served a request.
+    async def _acquire_adapter(self, model_id: str, model_name: str, seq: int) -> None:
+        """Record that a request against ``model_name`` is starting.
 
-        ``seq`` is the order this request *started* in, not the order it finished. Samples
-        for consecutive checkpoints overlap, so ranking by completion lets a straggler from
-        the older checkpoint declare itself live and unload the newer adapter that requests
-        are still arriving for -- while the genuinely stale one leaks, which is the opposite
-        of the point. Start order is the closest signal available here: checkpoint ids are
-        caller-supplied strings with no guaranteed ordering, and a sample cannot start
-        before its adapter was published.
-
-        Best-effort: a failed unload just reverts to the old accumulate-and-wedge
-        behaviour, it never breaks sampling. The lock serialises only the bookkeeping,
-        so exactly one sample per rollover issues the unload; the rest do not wait on it.
+        ``seq`` is start order, not completion order: samples for consecutive checkpoints
+        overlap, and a sample cannot start before its adapter was published, so start order
+        is the closest thing to a publication order available here (checkpoint ids are
+        caller-supplied strings with no guaranteed ordering).
         """
         async with self._lora_lock:
-            live = self._live_lora.get(model_id)
-            if live is not None and (live[1] == model_name or live[0] > seq):
-                # Already the live adapter, or an older request finishing late -- either way
-                # there is nothing this call should unload.
-                return
-            self._live_lora[model_id] = (seq, model_name)
-        if live is None:
-            return
-        previous = live[1]
-        try:
-            response = await http_client.post("/unload_lora_adapter", json={"lora_name": previous})
-            response.raise_for_status()
-        except httpx.HTTPError:
-            # Non-fatal: worst case the old adapter lingers, which is just the prior
-            # (working-but-leaky) behaviour.
-            logger.warning(f"Failed to unload stale LoRA adapter {previous}; it will linger on the engine")
+            use = self._lora_use.setdefault(model_id, {}).setdefault(model_name, _AdapterUse())
+            use.last_seq = max(use.last_seq, seq)
+            use.inflight += 1
+
+    async def _release_adapter(self, model_id: str, model_name: str) -> None:
+        """Drop this request's in-flight reference, whether or not it succeeded."""
+        async with self._lora_lock:
+            use = self._lora_use.get(model_id, {}).get(model_name)
+            if use is not None:
+                use.inflight -= 1
+
+    async def _retire_quiet_adapters(self, model_id: str, http_client: httpx.AsyncClient) -> None:
+        """Unload this model's adapters that have gone quiet.
+
+        An adapter is retired only when it has no requests in flight *and* is not the
+        most recently started adapter for the model. Both conditions matter: unloading an
+        adapter with work outstanding makes vLLM 404 those in-flight samples, and unloading
+        the newest one just forces an immediate re-resolve. Two checkpoints under concurrent
+        load keep refreshing their own last-use seq and in-flight count, so neither retires
+        the other while both are being sampled.
+
+        Retirement is recoverable rather than destructive: the adapter directory stays on
+        disk, so vLLM's filesystem resolver reloads it by name if it is sampled again.
+
+        Best-effort: a failed unload just reverts to the old accumulate-and-wedge
+        behaviour, it never breaks sampling.
+        """
+        async with self._lora_lock:
+            uses = self._lora_use.get(model_id, {})
+            newest = max(uses, key=lambda n: uses[n].last_seq, default=None)
+            stale = [n for n, use in uses.items() if n != newest and use.inflight <= 0]
+            for name in stale:
+                del uses[name]
+
+        for previous in stale:
+            try:
+                response = await http_client.post("/unload_lora_adapter", json={"lora_name": previous})
+                response.raise_for_status()
+            except httpx.HTTPError:
+                # Non-fatal: worst case the old adapter lingers, which is just the prior
+                # (working-but-leaky) behaviour.
+                logger.warning(f"Failed to unload stale LoRA adapter {previous}; it will linger on the engine")
 
     async def call_and_store_result(
         self,
@@ -201,20 +232,27 @@ class ExternalInferenceClient:
         if session_id is not None:
             headers["X-Session-ID"] = session_id
 
-        response = await http_client.post("/completions", json=payload, headers=headers)
-        if response.status_code >= 400:
-            # Surface the engine's error body: vLLM 400s carry the actual reason
-            # (over-cap logprobs, context overflow, greedy n>1, ...) and a bare
-            # raise_for_status turns them all into an undiagnosable status line.
-            detail = response.text[:500]
-            raise RuntimeError(f"vLLM /completions returned {response.status_code}: {detail}")
-        result = response.json()
-
-        # The request succeeded, so this adapter is definitely resident; retire the one it
-        # replaced. Done after the call rather than before so a failed sample never unloads
-        # a working adapter.
+        # Hold an in-flight reference across the call so a concurrent retirement cannot
+        # unload the adapter this request is being served by.
         if not base_model:
-            await self._retire_previous_adapter(model_id, model_name, lora_seq, http_client)
+            await self._acquire_adapter(model_id, model_name, lora_seq)
+        try:
+            response = await http_client.post("/completions", json=payload, headers=headers)
+            if response.status_code >= 400:
+                # Surface the engine's error body: vLLM 400s carry the actual reason
+                # (over-cap logprobs, context overflow, greedy n>1, ...) and a bare
+                # raise_for_status turns them all into an undiagnosable status line.
+                detail = response.text[:500]
+                raise RuntimeError(f"vLLM /completions returned {response.status_code}: {detail}")
+            result = response.json()
+        finally:
+            if not base_model:
+                await self._release_adapter(model_id, model_name)
+
+        # Only sweep on the success path: a failed sample is no evidence that the adapters
+        # it would retire have actually been superseded.
+        if not base_model:
+            await self._retire_quiet_adapters(model_id, http_client)
 
         prompt_logprobs = None
         topk = None
