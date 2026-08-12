@@ -697,8 +697,15 @@ class JaxBackendImpl(AbstractBackend):
             )
             return accumulated_grads.reset_adapter(adapter_index), new_lora_params, new_adam_state, metrics
 
+        def reset_adapter_slots(
+            accumulated_grads: AccumulatedGradients, adam_state: AdamState, adapter_index: jax.Array
+        ) -> tuple[AccumulatedGradients, AdamState]:
+            """Zero one adapter's slice of the shared gradient and optimizer buffers."""
+            return accumulated_grads.reset_adapter(adapter_index), adam_state.reset_adapter(adapter_index)
+
         if self.config.enforce_eager:
             self._compute_grads_and_update = compute_grads_and_update
+            self._reset_adapter_slots = reset_adapter_slots
         else:
             adam_state_shardings = shardings_of(self.adam_state)
             self._compute_grads_and_update = jax.jit(
@@ -710,6 +717,15 @@ class JaxBackendImpl(AbstractBackend):
                 # on return and XLA can update the slot in place instead of copying the whole
                 # max_lora_adapters-stacked tree.
                 donate_argnames=("accumulated_grads", "lora_params", "adam_state"),
+            )
+            # Donated for the same reason: delete_model replaces both buffers outright, so
+            # running the scatters eagerly would materialise a second full fp32 copy of
+            # grad_sum, mu and nu on a backend already sized to hold exactly one of each.
+            self._reset_adapter_slots = jax.jit(
+                reset_adapter_slots,
+                in_shardings=(accumulated_grads_shardings, adam_state_shardings, None),
+                out_shardings=(accumulated_grads_shardings, adam_state_shardings),
+                donate_argnames=("accumulated_grads", "adam_state"),
             )
 
     def has_model(self, model_id: str) -> bool:
@@ -783,8 +799,9 @@ class JaxBackendImpl(AbstractBackend):
             # index starts fresh. Gradients matter as much as the moments: a model deleted
             # between forward_backward and optim_step leaves a non-zero grad_sum and count
             # behind, which the next occupant of the slot would step on.
-            self.adam_state = self.adam_state.reset_adapter(jnp.int32(adapter_index))
-            self.accumulated_grads = self.accumulated_grads.reset_adapter(jnp.int32(adapter_index))
+            self.accumulated_grads, self.adam_state = self._reset_adapter_slots(
+                self.accumulated_grads, self.adam_state, jnp.int32(adapter_index)
+            )
 
         # Delete model metadata
         del self.models[model_id]
@@ -849,7 +866,10 @@ class JaxBackendImpl(AbstractBackend):
         # the batch. Each bucket is <= global_max_len, so peak memory never increases.
         bucket_per_micro_batch = self.config.train_bucket_seq_len_per_micro_batch
 
-        attention_masks = [[1] * n for n in seq_lens]
+        # The mask is just "is this position within the sequence", so build it as a
+        # comparison against seq_lens per micro-batch rather than materializing a
+        # batch_size x seq_len Python list-of-lists on every step.
+        seq_lens_arr = np.asarray(seq_lens, dtype=np.int32)
         adapter_indices = np.array(all_adapter_indices, dtype=np.int32)
         loss_fn_types = np.array(all_loss_fn_types, dtype=np.int32)
         loss_fn_config = self._build_loss_fn_config(all_loss_fn_configs)
@@ -876,6 +896,11 @@ class JaxBackendImpl(AbstractBackend):
                     """Slice one micro-batch out of `rows` and pad it to [fsdp-multiple, mb_len]."""
                     return pad_to_fsdp(pad_batch(rows[mb_start:mb_end], mb_len, dtype), fsdp_size)
 
+                def attn_mask():
+                    """1 for real tokens, 0 for padding, as [fsdp-multiple, mb_len]."""
+                    lens = seq_lens_arr[mb_start:mb_end, None]
+                    return pad_to_fsdp((np.arange(mb_len, dtype=np.int32)[None, :] < lens).astype(np.int32), fsdp_size)
+
                 def scalars(rows):
                     """Slice one micro-batch of per-sequence values and pad to an fsdp multiple."""
                     return pad_to_fsdp(rows[mb_start:mb_end], fsdp_size)
@@ -896,7 +921,7 @@ class JaxBackendImpl(AbstractBackend):
                     ) = jax.device_put(
                         (
                             seqs(all_input_ids, np.int32),
-                            seqs(attention_masks, np.int32),
+                            attn_mask(),
                             seqs(all_targets, np.int32),
                             seqs(all_token_weights, np.float32),
                             seqs(all_sampling_logprobs, np.float32),
