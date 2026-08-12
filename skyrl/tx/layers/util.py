@@ -17,6 +17,20 @@ def _ragged_contract(a: jax.Array, b: jax.Array, group_sizes: jax.Array) -> jax.
     at a time against a masked ``[m, p]`` operand, so no ``[G, m, p]`` tensor is ever built
     and peak backward memory stops scaling with the adapter count.
 
+    On paper this trades FLOPs for memory: each group's matmul spans *all* m tokens rather
+    than just its own, so the arithmetic looks like ``num_groups`` x a single dense
+    contraction. Measured, it does not work out that way -- XLA concatenates the per-group
+    operands into one wider GEMM (visible in the HLO as a ``concatenate`` feeding a single
+    ``dot``), so the masked path scales far better than num_groups and beats the stock
+    transpose on both axes at every group count tested:
+
+        RTX 5000 Ada, bf16, backward only, median of 8 (m x k x rank -> speedup, peak GiB)
+        4096 x 4096 x 64:  G=1 1.18x (0.16/0.16)   G=8 5.47x (0.32/0.36)   G=32 6.02x (0.62/1.14)
+        2048 x 8192 x 32:  G=1 1.05x (0.16/0.16)   G=8 6.84x (0.32/0.36)   G=32 7.58x (0.36/1.14)
+
+    So this is the right default wherever the gate below admits it, and the gate only has to
+    keep it away from shapes too small for either effect to matter (G=1 is within noise).
+
     ``num_groups`` is static, so the per-group work is emitted straight-line rather than as a
     ``fori_loop``. That is not a style choice: the while-loop spelling segfaults the XLA
     compiler (CPU *and* GPU) inside Qwen3.5's graph, at every batch size tried, while the

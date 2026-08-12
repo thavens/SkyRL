@@ -773,6 +773,10 @@ class Qwen3_5TextModel(nnx.Module):
         # Only applies while training (no backward pass during cached decode).
         remat_layers = self.config.gradient_checkpointing and is_training
 
+        # Loop-invariant: both depend only on kv_cache, never on layer_idx.
+        has_cache = kv_cache is not None
+        has_conv_cache = has_cache and kv_cache.conv_states is not None and kv_cache.recurrent_states is not None
+
         for layer_idx, layer in enumerate(self.layers):
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
@@ -787,11 +791,6 @@ class Qwen3_5TextModel(nnx.Module):
                         graphdef, state, hidden_states, attention_mask, positions, adapter_indices
                     )
                     continue
-
-                has_cache = kv_cache is not None
-                has_conv_cache = (
-                    has_cache and kv_cache.conv_states is not None and kv_cache.recurrent_states is not None
-                )
 
                 if self.layer_types[layer_idx] == "full_attention":
                     layer_kv = (kv_cache.keys[layer_idx], kv_cache.values[layer_idx]) if has_cache else None

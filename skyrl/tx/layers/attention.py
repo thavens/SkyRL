@@ -5,12 +5,15 @@ import os
 import jax
 import jax.numpy as jnp
 
+from skyrl.utils.log import logger
+
 # cuDNN flash attention supported dtypes/head dimensions
 # https://github.com/jax-ml/jax/blob/8b1f782540f71fbe230a2dccd331975faafc6c83/jax/_src/cudnn/fused_attention_stablehlo.py#L290
 _CUDNN_SUPPORTED_DTYPES = (jnp.float16, jnp.bfloat16, jnp.float8_e4m3fn, jnp.float8_e5m2)
 # cuDNN's head-dim cap is hardware dependent: 256 on Hopper (sm_90)+, 128 on
 # Ampere/Ada. Set SKYRL_CUDNN_MAX_HEAD_DIM=256 on Hopper+ so head_dim=256 models
-# (e.g. Qwen3.5) use cuDNN instead of the Pallas/XLA fallback. See runbook.md §9.
+# (e.g. Qwen3.5) use cuDNN instead of the Pallas/XLA fallback. See the "Attention
+# backend" section of runbook.md.
 _CUDNN_MAX_HEAD_DIM = int(os.environ.get("SKYRL_CUDNN_MAX_HEAD_DIM", "128"))
 
 # Pallas/Triton flash attention (jax.experimental) is used for head dims that
@@ -18,8 +21,17 @@ _CUDNN_MAX_HEAD_DIM = int(os.environ.get("SKYRL_CUDNN_MAX_HEAD_DIM", "128"))
 # Triton, so guard it for CPU/TPU-only environments.
 try:
     from jax.experimental.pallas.ops.gpu import attention as _pl_gpu_attn
-except Exception:  # pragma: no cover - import only succeeds with the GPU/Triton stack
+
+    _pl_gpu_attn_error = None
+except Exception as _e:  # pragma: no cover - import only succeeds with the GPU/Triton stack
     _pl_gpu_attn = None
+    # Kept rather than discarded: on a GPU box this import failing is the difference
+    # between flash attention and the quadratic-memory XLA path, and a bare `except`
+    # that swallows a Triton version mismatch makes the resulting OOM undiagnosable.
+    _pl_gpu_attn_error = _e
+
+# Guards the one-time warning below; a per-call log would fire once per traced step.
+_warned_quadratic_fallback = False
 
 _PALLAS_SUPPORTED_DTYPES = (jnp.float16, jnp.bfloat16)
 # Small blocks keep the kernel's shared-memory footprint within the ~100KB/SM
@@ -128,6 +140,26 @@ def dot_product_attention(
 
     # CPU/TPU fallback, and GPU fallback for models whose head size is not
     # accepted by cuDNN flash attention.
+    #
+    # On GPU this branch materializes the full [batch, heads, q_len, kv_len] score
+    # matrix. That is fine for short decode steps, but reaching it during a long
+    # causal pass means both faster kernels were declined -- typically a head_dim
+    # above _CUDNN_MAX_HEAD_DIM combined with the Pallas import having failed -- and
+    # the run is about to OOM for a reason nothing else would explain.
+    global _warned_quadratic_fallback
+    if is_gpu and is_causal and not _warned_quadratic_fallback and q.shape[1] > _PALLAS_BLOCK:
+        _warned_quadratic_fallback = True
+        reason = (
+            f"Pallas GPU attention unavailable ({type(_pl_gpu_attn_error).__name__}: {_pl_gpu_attn_error})"
+            if _pl_gpu_attn is None
+            else f"dtype {q.dtype} unsupported by the Pallas kernel"
+        )
+        logger.warning(
+            f"Falling back to quadratic XLA attention for head_dim={head_dim} at q_len={q.shape[1]}: "
+            f"cuDNN declined (cap SKYRL_CUDNN_MAX_HEAD_DIM={_CUDNN_MAX_HEAD_DIM}) and {reason}. "
+            "This materializes the full score matrix and will OOM at training sequence lengths; "
+            "on sm_90+ set SKYRL_CUDNN_MAX_HEAD_DIM=256."
+        )
     return jax.nn.dot_product_attention(
         q,
         k,
