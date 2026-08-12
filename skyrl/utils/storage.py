@@ -7,6 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from tempfile import TemporaryDirectory, mkdtemp
 from typing import Generator, Optional
+from uuid import uuid4
 
 from cloudpathlib import AnyPath
 
@@ -84,11 +85,16 @@ def write_and_publish_dir(dest: AnyPath, rank: Optional[int] = None) -> Generato
         if _skip_for_rank(dest, rank):
             return
 
-        # Idempotent re-save / retry with the same (deterministic) content: if dest
-        # already exists, treat it as already-published. The DB checkpoint status is
-        # the readiness source of truth, not the file layout.
+        # An existing dest is replaced, not kept. Callers re-save under a name precisely
+        # when the contents changed (``save_weights_for_sampler(name="latest")`` every
+        # optimizer step is the normal case), so treating the path as already-published
+        # would serve stale weights forever while reporting success. rename(2) cannot
+        # overwrite a non-empty directory, hence the move-aside.
+        old = None
         if dest.exists():
-            return
+            # Just a unique rename target -- never opened, so it does not need mkdtemp.
+            old = dest.parent / f".{dest.name}.old.{uuid4().hex}"
+            os.rename(dest, old)
 
         # Atomic on the same filesystem; a concurrent reader never sees a partial dir.
         # Tolerate a lost publish race (e.g. the Ray path where no .probe is written
@@ -97,8 +103,16 @@ def write_and_publish_dir(dest: AnyPath, rank: Optional[int] = None) -> Generato
         try:
             os.rename(tmp, dest)
         except OSError:
+            if old is not None:
+                # Our replacement did not land -- restore the copy we moved aside rather
+                # than leaving dest missing entirely.
+                os.rename(old, dest)
+                old = None
             if not dest.exists():
                 raise
+        finally:
+            if old is not None:
+                shutil.rmtree(old, ignore_errors=True)
     finally:
         # No-op if the staging dir was renamed away; cleans it up otherwise.
         shutil.rmtree(tmp, ignore_errors=True)
