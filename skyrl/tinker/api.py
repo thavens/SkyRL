@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import random
 import re
@@ -14,6 +15,7 @@ from uuid import uuid4
 import fastapi
 import psutil
 from fastapi import Depends, FastAPI, HTTPException, Request, Response
+from fastapi.encoders import jsonable_encoder
 from fastapi.responses import RedirectResponse, StreamingResponse
 from pydantic import (
     Base64Bytes,
@@ -21,6 +23,7 @@ from pydantic import (
     Discriminator,
     Field,
     Tag,
+    ValidationError,
     model_validator,
 )
 from sqlalchemy.exc import IntegrityError
@@ -926,26 +929,46 @@ async def _parse_forward_backward_body(req: Request) -> tuple[ForwardBackwardReq
     SDK >=0.25 posts protobuf (Content-Type application/x-protobuf) with the
     forward/forward_backward distinction carried in-band as ``forward_only``;
     older SDKs post JSON to this endpoint (always fwd+bwd) and hit
-    /api/v1/forward for forward-only. Decoding errors surface as 400s rather
-    than pydantic 422s -- FastAPI's validation-error encoder chokes on the
-    raw proto bytes it would embed in the 422 detail.
+    /api/v1/forward for forward-only. Proto decoding errors surface as 400s
+    rather than pydantic 422s -- FastAPI's validation-error encoder chokes on
+    the raw proto bytes it would embed in the 422 detail.
+
+    Parsing by hand means FastAPI no longer converts a bad body into a 422 for
+    us, so JSON errors are translated explicitly. Letting a ValidationError
+    escape would return a detail-free 500, which the SDK classifies as
+    retryable -- the client would re-POST the same invalid batch until its
+    timeout instead of surfacing the offending field.
     """
     content_type = req.headers.get("content-type", "")
     if "application/x-protobuf" not in content_type:
-        return ForwardBackwardRequest.model_validate(await req.json()), False
+        try:
+            payload = await req.json()
+        except (json.JSONDecodeError, UnicodeDecodeError) as e:
+            raise HTTPException(status_code=400, detail=f"Malformed JSON forward_backward request: {e}")
+        try:
+            return ForwardBackwardRequest.model_validate(payload), False
+        except ValidationError as e:
+            raise HTTPException(status_code=422, detail=jsonable_encoder(e.errors()))
     body = await req.body()
     if req.headers.get("content-encoding") == "zstd":
         # Only sent when the server's client-config opts in, which we never do;
         # reject loudly rather than feed compressed bytes to the proto parser.
         raise HTTPException(status_code=415, detail="zstd-compressed request bodies are not supported")
     try:
-        decoded = proto_conv.deserialize_forward_backward_request(body)
+        # Multi-MB parse plus a np.frombuffer/tolist over every token tensor in the batch;
+        # keep it off the event loop, mirroring the encode side in retrieve_future.
+        decoded = await asyncio.to_thread(proto_conv.deserialize_forward_backward_request, body)
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid protobuf forward_backward request: {e}")
     if decoded is None:
         raise HTTPException(status_code=415, detail="Server cannot decode protobuf requests (no SDK proto module)")
     request_dict, forward_only = decoded
-    return ForwardBackwardRequest.model_validate(request_dict), forward_only
+    try:
+        return ForwardBackwardRequest.model_validate(request_dict), forward_only
+    except ValidationError as e:
+        # 400, not 422: the offending payload was proto, so the field paths in
+        # e.errors() refer to the decoded dict rather than anything the client sent.
+        raise HTTPException(status_code=400, detail=f"Invalid protobuf forward_backward request: {e}")
 
 
 @app.post("/api/v1/forward_backward", response_model=FutureResponse)
@@ -1282,6 +1305,18 @@ def checkpoint_file_path(
 
     # Resolve to the artifact that actually exists: sampler adapters may be published as a
     # plain directory rather than a tar.gz (see EngineConfig.publishes_sampler_adapter_in_place).
+    #
+    # The tempting cleanup here is to record the published path on the CheckpointDB row and
+    # read it back instead of probing. Evaluated and rejected: `SQLModel.metadata.create_all`
+    # only creates missing *tables*, never adds columns, and alembic is configured
+    # (skyrl/tinker/alembic.ini) but has zero versions and is never invoked at startup -- so
+    # a new column would make every checkpoint query fail on any existing database until
+    # someone hand-migrates it. It also buys less than it looks: the stored path could not
+    # replace the 410 (operators are told to `rm -rf` the adapter dir when bouncing vLLM, so
+    # artifacts legitimately vanish behind the DB's back), could not help
+    # tools/import_peft_adapter.py (an HTTP client with no DB access), and would not remove
+    # the forwarder's exists() check (a cache-hit test, not a layout probe). One local stat
+    # is the cheaper trade.
     if checkpoint_type == types.CheckpointType.SAMPLER:
         if cfg.publishes_sampler_adapter_in_place:
             adapter_dir = cfg.sampler_adapter_dir(unique_id, checkpoint_id)
@@ -1405,7 +1440,23 @@ async def download_checkpoint_archive(
         request, unique_id, checkpoint_id, types.CheckpointType.SAMPLER, session
     )
 
-    file_buffer = await asyncio.to_thread(read_as_archive, checkpoint_path)
+    # The DB row says COMPLETED but the bytes can still be gone: with in-place publishing
+    # the only artifact lives under --external-inference-lora-base, which is routinely a
+    # tmpfs or container-local path that does not survive a restart while checkpoints_base
+    # does. Report that rather than letting it surface as a bare 500. Detected from inside
+    # the worker thread -- checkpoint_path may be a CloudPath, so an existence probe here
+    # would be a blocking network round-trip on the event loop.
+    try:
+        file_buffer = await asyncio.to_thread(read_as_archive, checkpoint_path)
+    except FileNotFoundError:
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                f"Checkpoint {unique_id}/{checkpoint_id} is registered but its data is gone from "
+                f"{checkpoint_path}. Sampler adapters are stored under --external-inference-lora-base, "
+                "which must be as durable as --checkpoints-base for checkpoints to survive a restart."
+            ),
+        )
 
     filename = f"{unique_id}_{checkpoint_id}.tar.gz"
     headers = {

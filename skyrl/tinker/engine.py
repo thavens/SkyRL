@@ -279,12 +279,34 @@ class TinkerEngine:
                 "backend and reclaim slot 0, or raise max_lora_adapters to 2."
             )
 
+    @staticmethod
+    def _warn_if_sampler_storage_is_ephemeral(config: EngineConfig) -> None:
+        """Warn when sampler adapters are the only copy and live somewhere volatile.
+
+        With in-place publishing the adapter directory under --external-inference-lora-base
+        is the *sole* artifact -- no tar.gz is written under --checkpoints-base. If that
+        directory is a tmpfs or container-local path, every sampler checkpoint silently
+        stops resolving after a restart while its DB row still reports COMPLETED.
+        """
+        if not config.publishes_sampler_adapter_in_place:
+            return
+        lora_base = str(config.external_inference_lora_base)
+        if lora_base.startswith(("/tmp/", "/dev/shm/", "/var/tmp/")):
+            logger.warning(
+                f"Sampler adapters are published in place under {lora_base}, which does not survive "
+                "a reboot or container restart -- and no tar.gz copy is written under "
+                f"{config.checkpoints_base}. Checkpoints there will 410 after a restart even though "
+                "the database still lists them. Point --external-inference-lora-base at durable "
+                "storage if sampler checkpoints need to outlive the process."
+            )
+
     def __init__(
         self,
         config: EngineConfig,
     ):
         """Initialize the engine with a database connection and base model."""
         self.config = config
+        self._warn_if_sampler_storage_is_ephemeral(config)
         self.db_engine = create_engine(config.database_url, echo=False)
         enable_sqlite_wal(self.db_engine)
 
