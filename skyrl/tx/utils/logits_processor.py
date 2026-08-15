@@ -73,10 +73,22 @@ class LogitsProcessorMixin(ABC):
             target_ids: Target token IDs [B, T] or [B].
 
         Returns:
-            Log probabilities for target tokens [B, T] or [B].
+            Log probabilities for target tokens [B, T] or [B], in float32.
         """
-        log_sum_exp = jax.nn.logsumexp(logits, axis=-1, keepdims=True)
-        target_logits = jnp.take_along_axis(logits, target_ids[..., None], axis=-1)
+        # The normalizer is a reduction over the whole vocabulary -- 248k entries for
+        # Qwen3.5. Accumulating that in bf16 costs ~0.028 nats of error per token
+        # (p99 ~0.081), which is the dominant term in the gap between these logprobs and
+        # a vLLM sampler's, and on its own enough to push tokens outside a 0.2 PPO clip
+        # band. In fp32 the same reduction costs ~0.002 nats. The lm_head output stays
+        # bf16; only the reduction is widened.
+        #
+        # The upcast is applied to the logsumexp input rather than to `logits` as a whole
+        # so XLA fuses the convert into the reduction: with loss_chunk_size=0 the full
+        # [B, T, V] logits are ~1 GiB at training shapes and an fp32 copy of them would
+        # not fit. The target gather stays on the bf16 tensor (a gather is exact) and is
+        # widened afterwards, for the same reason.
+        log_sum_exp = jax.nn.logsumexp(logits.astype(jnp.float32), axis=-1, keepdims=True)
+        target_logits = jnp.take_along_axis(logits, target_ids[..., None], axis=-1).astype(jnp.float32)
         return (target_logits - log_sum_exp).squeeze(-1)
 
     def _compute_chunked_logprobs(

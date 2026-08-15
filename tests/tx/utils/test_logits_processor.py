@@ -4,6 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from skyrl.tx.utils.logits_processor import LogitsProcessorMixin
 from tests.tx.utils.test_generator import DummyModel
 
 
@@ -98,3 +99,48 @@ class TestChunkedLogprobs:
             rtol=1e-5,
             atol=1e-5,
         )
+
+
+class TestLogprobNormalizerPrecision:
+    """The vocab-sized log-normalizer must not be accumulated in the logits' own dtype.
+
+    Qwen3.5 pairs a bf16 lm_head with a 248k-entry vocabulary. Summing exp() over that
+    many bf16 terms loses ~0.03 nats per token (p99 ~0.08), which surfaces directly as
+    sampler/trainer logprob mismatch -- and therefore as PPO clipping -- in RL, since the
+    vLLM sampler normalizes in fp32. The existing chunked-vs-nonchunked tests run at
+    vocab_size=16 in fp32 and cannot see this.
+    """
+
+    @staticmethod
+    def _reference_logprobs(logits_bf16: jnp.ndarray, targets: np.ndarray) -> np.ndarray:
+        """log_softmax of the *same* bf16-rounded logits, accumulated in float64.
+
+        Using the bf16 values as the reference input isolates the precision of the
+        reduction from the precision of the logits themselves.
+        """
+        x = np.asarray(logits_bf16, dtype=np.float64)
+        m = x.max(axis=-1, keepdims=True)
+        lse = m + np.log(np.exp(x - m).sum(axis=-1, keepdims=True))
+        return (np.take_along_axis(x, targets[:, None], axis=-1) - lse).squeeze(-1)
+
+    def test_bf16_logits_are_normalized_in_fp32(self):
+        # Large enough that a bf16 accumulator visibly drifts; a few hundred entries would not.
+        B, V = 8, 200_000
+        rng = np.random.default_rng(0)
+        logits = (rng.standard_normal((B, V)) * 2.0).astype(np.float32)
+        # A few dominant logits, as in a trained LM head.
+        logits[np.arange(B), rng.integers(0, V, B)] += 8.0
+        targets = rng.integers(0, V, B)
+
+        logits_bf16 = jnp.asarray(logits, jnp.bfloat16)
+        got = np.asarray(
+            LogitsProcessorMixin.logits_to_logprobs(logits_bf16, jnp.asarray(targets)),
+            dtype=np.float64,
+        )
+
+        # Returned in fp32: a bf16 logprob cannot represent the gap it is about to be
+        # differenced against on the sampler side.
+        assert LogitsProcessorMixin.logits_to_logprobs(logits_bf16, jnp.asarray(targets)).dtype == jnp.float32
+
+        # An fp32 reduction lands within ~1e-4 of the float64 result; a bf16 one is ~1e-2 off.
+        np.testing.assert_allclose(got, self._reference_logprobs(logits_bf16, targets), atol=1e-4)

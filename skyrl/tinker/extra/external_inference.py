@@ -219,6 +219,28 @@ class ExternalInferenceClient:
             "stream": False,
             "return_token_ids": True,
         }
+        # Stop conditions have to be forwarded explicitly. Dropping them does not fail
+        # loudly -- every completion simply runs to max_tokens, and in an RL loop that
+        # means the tokens past the intended stop (a new turn the renderer never asked
+        # for, or degenerate filler) get trained on with full weight. The in-process
+        # generator honours both (see GeneratorMixin.generate / find_string_stop_position),
+        # so omitting them here also made the two sampling paths disagree.
+        #
+        # `sampling_params` here is the API-layer model, whose `stop` is still the raw
+        # `list[int] | list[str]` the SDK sent -- the int/str split that api.SamplingParams
+        # .to_types() performs has not run on this path. Mirror it rather than calling
+        # to_types(), which would also mint a random seed as a side effect.
+        stop = request.sampling_params.stop or []
+        if stop:
+            if all(isinstance(s, int) for s in stop):
+                payload["stop_token_ids"] = list(stop)
+            else:
+                payload["stop"] = [str(s) for s in stop]
+            # Match the in-process generator, which truncates *after* the token that
+            # completed the stop (find_string_stop_position returns i + 1) rather than
+            # dropping it, so both sampling paths return the same tokens.
+            payload["include_stop_str_in_output"] = True
+
         # vLLM's `prompt_logprobs` is an int: 0 returns just the prompt tokens'
         # own logprobs, k>0 also returns the top-k per position.
         topk_prompt_logprobs = getattr(request, "topk_prompt_logprobs", 0) or 0
