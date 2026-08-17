@@ -598,11 +598,15 @@ class TinkerEngine:
         unloaded_count = 0
 
         with Session(self.db_engine) as session:
-            # Find stale sessions (active sessions with heartbeat older than cutoff)
+            # Find stale sessions: active, with the last heartbeat older than the
+            # cutoff. A session that never heartbeat has last_heartbeat_at NULL,
+            # which any comparison excludes -- fall back to created_at, or a
+            # client that dies before its first heartbeat pins its adapter slot
+            # forever.
             stale_sessions = session.exec(
                 select(SessionDB).where(
                     SessionDB.status == "active",
-                    SessionDB.last_heartbeat_at < cutoff,
+                    func.coalesce(SessionDB.last_heartbeat_at, SessionDB.created_at) < cutoff,
                 )
             ).all()
 
